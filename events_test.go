@@ -26,6 +26,18 @@ func waitChannelFor(wg *sync.WaitGroup) <-chan struct{} {
 	return ch
 }
 
+func strcmp[T comparable](t *testing.T, a, b T) {
+	if a != b {
+		t.Errorf("Expected %+v. Got: %+v", a, b)
+	}
+}
+
+func TestTypeOf(t *testing.T) {
+	strcmp(t, typeOf[TestEvent](), "github.com/kubecost/events/TestEvent")
+	strcmp(t, typeOf[*TestEvent](), "*github.com/kubecost/events/TestEvent")
+	strcmp(t, typeOf[**TestEvent](), "**github.com/kubecost/events/TestEvent")
+}
+
 func TestDispatchEventStream(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)

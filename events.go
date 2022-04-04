@@ -17,8 +17,24 @@ func init() {
 
 // typeOf is a utility that can covert a T type to a package + type name for generic types.
 func typeOf[T any]() string {
-	t := reflect.TypeOf(*new(T))
-	return fmt.Sprintf("%s/%s", t.PkgPath(), t.Name())
+	var inst T
+	var prefix string
+
+	// get a reflect.Type of a variable with type T
+	t := reflect.TypeOf(inst)
+
+	// pointer types do not carry the adequate type information, so we need to extract the
+	// underlying types until we reach the non-pointer type, we prepend a * each depth
+	for t != nil && t.Kind() == reflect.Ptr {
+		prefix += "*"
+		t = t.Elem()
+	}
+	if t == nil {
+		panic(fmt.Sprintf("Unable to generate a key for type: %+v", t))
+	}
+
+	// combine the prefix, package path, and the type name
+	return fmt.Sprintf("%s%s/%s", prefix, t.PkgPath(), t.Name())
 }
 
 // DispatcherFor[T] locates an existing global dispatcher for an event type, or creates a new one
