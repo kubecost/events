@@ -29,8 +29,10 @@ func typeOf[T any]() string {
 		prefix += "*"
 		t = t.Elem()
 	}
+
+	// this should not be possible, but in the event that it does, we want to be loud about it
 	if t == nil {
-		panic(fmt.Sprintf("Unable to generate a key for type: %+v", t))
+		panic(fmt.Sprintf("Unable to generate a key for type: %+v", reflect.TypeOf(inst)))
 	}
 
 	// combine the prefix, package path, and the type name
