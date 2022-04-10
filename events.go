@@ -39,9 +39,9 @@ func typeOf[T any]() string {
 	return fmt.Sprintf("%s%s/%s", prefix, t.PkgPath(), t.Name())
 }
 
-// DispatcherFor[T] locates an existing global dispatcher for an event type, or creates a new one
+// GlobalDispatcherFor[T] locates an existing global dispatcher for an event type, or creates a new one
 // if one does not exist
-func DispatcherFor[T any]() Dispatcher[T] {
+func GlobalDispatcherFor[T any]() Dispatcher[T] {
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -51,4 +51,9 @@ func DispatcherFor[T any]() Dispatcher[T] {
 	}
 
 	return dispatchers[key].(Dispatcher[T])
+}
+
+// NewDispatcher[T] creates a new multicast event dispatcher
+func NewDispatcher[T any]() Dispatcher[T] {
+	return newMulticastDispatcher[T]()
 }

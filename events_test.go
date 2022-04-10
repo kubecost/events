@@ -42,7 +42,7 @@ func TestDispatchEventStream(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	d := DispatcherFor[TestEvent]()
+	d := NewDispatcher[TestEvent]()
 
 	go waitAndDispatch(time.Second*1, d, TestEvent{"Test1"})
 	go waitAndDispatch(time.Second*3, d, TestEvent{"Test2"})
@@ -73,7 +73,7 @@ func TestSingleDispatcherMultipleHandlers(t *testing.T) {
 	// 30 total handler calls (10 events per handler)
 	wg.Add(3 * totalEvents)
 
-	d := DispatcherFor[TestEvent]()
+	d := NewDispatcher[TestEvent]()
 
 	var handlerOneCount uint64 = 0
 	d.AddEventHandler(func(event TestEvent) {
@@ -111,7 +111,7 @@ func TestSingleDispatcherMultipleHandlers(t *testing.T) {
 func TestAddRemoveHandlersMidStream(t *testing.T) {
 	const totalEvents = 10
 
-	d := DispatcherFor[TestEvent]()
+	d := NewDispatcher[TestEvent]()
 
 	var eventCount uint64 = 0
 	var h1 HandlerID
@@ -143,6 +143,59 @@ func TestAddRemoveHandlersMidStream(t *testing.T) {
 	if eventCount != 3 {
 		t.Errorf("Event Count != 3. Got: %d\n", eventCount)
 	}
+
+	// test that the internal event stream list is empty
+	eventStreams := len(d.(*multicastDispatcher[TestEvent]).getEventStreams())
+	if eventStreams != 0 {
+		t.Errorf("Event Streams were not empty. Got: %d\n", eventStreams)
+	}
+}
+
+func TestAddRemoveHandlersMidStreamSync(t *testing.T) {
+	const totalEvents = 10
+
+	d := NewDispatcher[TestEvent]()
+
+	// Synchronous Events require a receiver, so we create a single always running receiver
+	s := d.NewEventStream()
+	go func() {
+		for event := range s.Stream() {
+			t.Logf("Universal Handler: [Event %s]\n", event.Message)
+		}
+	}()
+
+	var eventCount uint64 = 0
+	var h1 HandlerID
+	h1 = d.AddEventHandler(func(event TestEvent) {
+		atomic.AddUint64(&eventCount, 1)
+		t.Logf("Handler One: [Event: %s]\n", event.Message)
+		d.RemoveEventHandler(h1)
+	})
+
+	var h2 HandlerID
+	h2 = d.AddEventHandler(func(event TestEvent) {
+		atomic.AddUint64(&eventCount, 1)
+		t.Logf("Handler Two: [Event: %s]\n", event.Message)
+		d.RemoveEventHandler(h2)
+	})
+
+	var h3 HandlerID
+	h3 = d.AddEventHandler(func(event TestEvent) {
+		atomic.AddUint64(&eventCount, 1)
+		t.Logf("Handler Three: [Event: %s]\n", event.Message)
+		d.RemoveEventHandler(h3)
+	})
+
+	for i := 0; i < totalEvents; i++ {
+		d.DispatchSync(TestEvent{fmt.Sprintf("%d", i+1)})
+	}
+
+	time.Sleep(2 * time.Second)
+	if eventCount != 3 {
+		t.Errorf("Event Count != 3. Got: %d\n", eventCount)
+	}
+
+	d.CloseEventStreams()
 
 	// test that the internal event stream list is empty
 	eventStreams := len(d.(*multicastDispatcher[TestEvent]).getEventStreams())
