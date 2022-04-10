@@ -61,6 +61,14 @@ type asyncEventStream[T any] struct {
 	closed *atomicbool
 }
 
+// newAsyncEventStream creates a new asynchronous event stream for a listener.
+func newAsyncEventStream[T any]() *asyncEventStream[T] {
+	return &asyncEventStream[T]{
+		closed: newAtomicBool(false),
+		stream: make(chan T),
+	}
+}
+
 // Stream returns access to the event T channel where events will arrive.
 func (aes *asyncEventStream[T]) Stream() <-chan T {
 	return aes.stream
@@ -127,8 +135,9 @@ func (md *multicastDispatcher[T]) AddEventHandler(handler EventHandler[T]) Handl
 			}
 		}
 
-		// in the event the handler is stream is closed via the dispatcher, the
-		// handler will still exist, so we remove here instead
+		// in the case the handler stream is closed via the dispatcher, the
+		// handler will still exist, so we'll need to remove here. If the
+		// handler was already removed, this will no-op.
 		md.handlerLock.Lock()
 		delete(md.handlers, id)
 		md.handlerLock.Unlock()
@@ -189,11 +198,7 @@ func (md *multicastDispatcher[T]) Dispatch(event T) {
 
 // NewEventStream returns an asynchronous event stream that can be used to receive dispatched events.
 func (md *multicastDispatcher[T]) NewEventStream() EventStream[T] {
-	aes := &asyncEventStream[T]{
-		closed: newAtomicBool(false),
-		stream: make(chan T),
-	}
-
+	aes := newAsyncEventStream[T]()
 	md.streams.Add(aes)
 	return aes
 }
