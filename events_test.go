@@ -204,6 +204,47 @@ func TestAddRemoveHandlersMidStreamSync(t *testing.T) {
 	}
 }
 
+// creates the dispatcher benchmark data structures
+func createDispatcherBenchmark[T any](numListeners int) (Dispatcher[T], []HandlerID, *sync.WaitGroup) {
+	var wg sync.WaitGroup
+	wg.Add(numListeners)
+
+	dispatcher := NewDispatcher[T]()
+	handlers := make([]HandlerID, numListeners)
+	for i := 0; i < numListeners; i++ {
+		handlers[i] = dispatcher.AddEventHandler(func(event T) {
+			wg.Done()
+		})
+	}
+
+	return dispatcher, handlers, &wg
+}
+
+// benchmark runner for a specific number of listeners
+func benchmarkDispatcher(numListeners int, b *testing.B) {
+	d, _, wg := createDispatcherBenchmark[TestEvent](numListeners)
+
+	b.ResetTimer()
+
+	for n := 0; n < b.N; n++ {
+		d.Dispatch(TestEvent{"Test"})
+
+		// wait for all listeners to trigger
+		wg.Wait()
+
+		b.StopTimer()
+		// reset wait group count
+		wg.Add(numListeners)
+		b.StartTimer()
+	}
+}
+
+func BenchmarkDispatcher5(b *testing.B) { benchmarkDispatcher(5, b) }
+
+func BenchmarkDispatcher100(b *testing.B) { benchmarkDispatcher(100, b) }
+
+func BenchmarkDispatcher1000(b *testing.B) { benchmarkDispatcher(1000, b) }
+
 /*
 func TestStoredChan(t *testing.T) {
 	ch := make(chan int)

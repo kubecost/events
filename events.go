@@ -8,11 +8,11 @@ import (
 
 var (
 	lock        sync.Mutex
-	dispatchers map[string]interface{}
+	dispatchers map[string]any
 )
 
 func init() {
-	dispatchers = make(map[string]interface{})
+	dispatchers = make(map[string]any)
 }
 
 // typeOf is a utility that can covert a T type to a package + type name for generic types.

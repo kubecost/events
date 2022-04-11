@@ -1,6 +1,9 @@
 package events
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 // set is an implementation prototype for a basic mathematical set data structure. It's API is geared more
 // towards a specific use inside the events package rather than a more general purpose use.
@@ -28,6 +31,9 @@ type set[T comparable] interface {
 	// ToSlice creates a new slice of size Length(), copies the set elements into the slice, and
 	// returns it.
 	ToSlice() []T
+
+	// CopyTo accepts a destination slice and writes the contents of the set to it.
+	CopyTo([]T) error
 }
 
 // lockingSet is a thread-safe implementation of set which leverages a go map for storage.
@@ -125,4 +131,26 @@ func (s *lockingSet[T]) ToSlice() []T {
 		index++
 	}
 	return slice
+}
+
+// CopyTo accepts a destination slice and writes the contents of the set to it.
+func (s *lockingSet[T]) CopyTo(destination []T) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	l := len(s.m)
+	if l == 0 {
+		return nil
+	}
+
+	if len(destination) > l {
+		return fmt.Errorf("Destination length(%d) < source length (%d)", len(destination), l)
+	}
+
+	index := 0
+	for k := range s.m {
+		destination[index] = k
+		index++
+	}
+	return nil
 }
