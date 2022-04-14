@@ -282,10 +282,10 @@ func (md *multicastDispatcher[T]) executeAsync(streams []*asyncEventStream[T], e
 		go func(stream *asyncEventStream[T]) {
 			defer func() {
 				if r := recover(); r != nil {
-					// FIXME: This will happen if events for the stream are queued and the stream is then closed.
-					// FIXME: Occurs due to a conflict caused by our design (allowing handlers to be externally
-					// FIXME: closed, which breaks go channel principles). We should look into a way to maintain
-					// FIXME: go principles and maintain our API.
+					// NOTE: This will happen if events for the stream are queued and the stream is then closed.
+					// NOTE: Occurs due to a conflict caused by our design (allowing handlers to be externally
+					// NOTE: closed, which breaks go channel principles). We should look into a way to maintain
+					// NOTE: go principles and maintain our API.
 				}
 			}()
 
@@ -312,10 +312,10 @@ func (md *multicastDispatcher[T]) executeSync(streams []*asyncEventStream[T], ev
 		go func(stream *asyncEventStream[T]) {
 			defer func() {
 				if r := recover(); r != nil {
-					// FIXME: This will happen if events for the stream are queued and the stream is then closed.
-					// FIXME: Occurs due to a conflict caused by our design (allowing handlers to be externally
-					// FIXME: closed, which breaks go channel principles). We should look into a way to maintain
-					// FIXME: go principles and maintain our API.
+					// NOTE: This will happen if events for the stream are queued and the stream is then closed.
+					// NOTE: Occurs due to a conflict caused by our design (allowing handlers to be externally
+					// NOTE: closed, which breaks go channel principles). We should look into a way to maintain
+					// NOTE: go principles and maintain our API.
 				}
 				wg.Done()
 			}()
