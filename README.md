@@ -29,7 +29,7 @@ func SecondCounterTo(target uint, dispatchEvery uint) {
     var count uint = 0
 
     // get a reference to the dispatcher for our count event
-    dispatcher := events.DispatcherFor[CountEvent]()
+    dispatcher := events.GlobalDispatcherFor[CountEvent]()
 
     // Loop until our count reaches the target 
     for {    
