@@ -26,11 +26,23 @@ func waitChannelFor(wg *sync.WaitGroup) <-chan struct{} {
 	return ch
 }
 
+func strcmp[T comparable](t *testing.T, a, b T) {
+	if a != b {
+		t.Errorf("Expected %+v. Got: %+v", a, b)
+	}
+}
+
+func TestTypeOf(t *testing.T) {
+	strcmp(t, typeOf[TestEvent](), "github.com/kubecost/events/TestEvent")
+	strcmp(t, typeOf[*TestEvent](), "*github.com/kubecost/events/TestEvent")
+	strcmp(t, typeOf[**TestEvent](), "**github.com/kubecost/events/TestEvent")
+}
+
 func TestDispatchEventStream(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	d := DispatcherFor[TestEvent]()
+	d := NewDispatcher[TestEvent]()
 
 	go waitAndDispatch(time.Second*1, d, TestEvent{"Test1"})
 	go waitAndDispatch(time.Second*3, d, TestEvent{"Test2"})
@@ -61,7 +73,7 @@ func TestSingleDispatcherMultipleHandlers(t *testing.T) {
 	// 30 total handler calls (10 events per handler)
 	wg.Add(3 * totalEvents)
 
-	d := DispatcherFor[TestEvent]()
+	d := NewDispatcher[TestEvent]()
 
 	var handlerOneCount uint64 = 0
 	d.AddEventHandler(func(event TestEvent) {
@@ -99,7 +111,7 @@ func TestSingleDispatcherMultipleHandlers(t *testing.T) {
 func TestAddRemoveHandlersMidStream(t *testing.T) {
 	const totalEvents = 10
 
-	d := DispatcherFor[TestEvent]()
+	d := NewDispatcher[TestEvent]()
 
 	var eventCount uint64 = 0
 	var h1 HandlerID
@@ -138,6 +150,100 @@ func TestAddRemoveHandlersMidStream(t *testing.T) {
 		t.Errorf("Event Streams were not empty. Got: %d\n", eventStreams)
 	}
 }
+
+func TestAddRemoveHandlersMidStreamSync(t *testing.T) {
+	const totalEvents = 10
+
+	d := NewDispatcher[TestEvent]()
+
+	// Synchronous Events require a receiver, so we create a single always running receiver
+	s := d.NewEventStream()
+	go func() {
+		for event := range s.Stream() {
+			t.Logf("Universal Handler: [Event %s]\n", event.Message)
+		}
+	}()
+
+	var eventCount uint64 = 0
+	var h1 HandlerID
+	h1 = d.AddEventHandler(func(event TestEvent) {
+		atomic.AddUint64(&eventCount, 1)
+		t.Logf("Handler One: [Event: %s]\n", event.Message)
+		d.RemoveEventHandler(h1)
+	})
+
+	var h2 HandlerID
+	h2 = d.AddEventHandler(func(event TestEvent) {
+		atomic.AddUint64(&eventCount, 1)
+		t.Logf("Handler Two: [Event: %s]\n", event.Message)
+		d.RemoveEventHandler(h2)
+	})
+
+	var h3 HandlerID
+	h3 = d.AddEventHandler(func(event TestEvent) {
+		atomic.AddUint64(&eventCount, 1)
+		t.Logf("Handler Three: [Event: %s]\n", event.Message)
+		d.RemoveEventHandler(h3)
+	})
+
+	for i := 0; i < totalEvents; i++ {
+		d.DispatchSync(TestEvent{fmt.Sprintf("%d", i+1)})
+	}
+
+	time.Sleep(2 * time.Second)
+	if eventCount != 3 {
+		t.Errorf("Event Count != 3. Got: %d\n", eventCount)
+	}
+
+	d.CloseEventStreams()
+
+	// test that the internal event stream list is empty
+	eventStreams := len(d.(*multicastDispatcher[TestEvent]).getEventStreams())
+	if eventStreams != 0 {
+		t.Errorf("Event Streams were not empty. Got: %d\n", eventStreams)
+	}
+}
+
+// creates the dispatcher benchmark data structures
+func createDispatcherBenchmark[T any](numListeners int) (Dispatcher[T], []HandlerID, *sync.WaitGroup) {
+	var wg sync.WaitGroup
+	wg.Add(numListeners)
+
+	dispatcher := NewDispatcher[T]()
+	handlers := make([]HandlerID, numListeners)
+	for i := 0; i < numListeners; i++ {
+		handlers[i] = dispatcher.AddEventHandler(func(event T) {
+			wg.Done()
+		})
+	}
+
+	return dispatcher, handlers, &wg
+}
+
+// benchmark runner for a specific number of listeners
+func benchmarkDispatcher(numListeners int, b *testing.B) {
+	d, _, wg := createDispatcherBenchmark[TestEvent](numListeners)
+
+	b.ResetTimer()
+
+	for n := 0; n < b.N; n++ {
+		d.Dispatch(TestEvent{"Test"})
+
+		// wait for all listeners to trigger
+		wg.Wait()
+
+		b.StopTimer()
+		// reset wait group count
+		wg.Add(numListeners)
+		b.StartTimer()
+	}
+}
+
+func BenchmarkDispatcher5(b *testing.B) { benchmarkDispatcher(5, b) }
+
+func BenchmarkDispatcher100(b *testing.B) { benchmarkDispatcher(100, b) }
+
+func BenchmarkDispatcher1000(b *testing.B) { benchmarkDispatcher(1000, b) }
 
 /*
 func TestStoredChan(t *testing.T) {

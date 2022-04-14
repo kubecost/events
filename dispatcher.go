@@ -50,13 +50,23 @@ type Dispatcher[T any] interface {
 
 	// NewEventStream returns an asynchronous event stream that can be used to receive dispatched events.
 	NewEventStream() EventStream[T]
+
+	// CloseEventStreams closes all listening event streams and shuts down the dispatcher
+	CloseEventStreams()
 }
 
 // asyncEventStream contains the event stream channel and metadata
 type asyncEventStream[T any] struct {
-	m        sync.Mutex
-	stream   chan T
-	isClosed bool
+	stream chan T
+	closed *atomicbool
+}
+
+// newAsyncEventStream creates a new asynchronous event stream for a listener.
+func newAsyncEventStream[T any]() *asyncEventStream[T] {
+	return &asyncEventStream[T]{
+		closed: newAtomicBool(false),
+		stream: make(chan T),
+	}
 }
 
 // Stream returns access to the event T channel where events will arrive.
@@ -66,27 +76,27 @@ func (aes *asyncEventStream[T]) Stream() <-chan T {
 
 // Close shuts down the event stream, closing the channel
 func (aes *asyncEventStream[T]) Close() {
-	aes.m.Lock()
-	defer aes.m.Unlock()
-	if aes.isClosed {
+	if !aes.closed.CompareAndSet(false, true) {
 		return
 	}
-	aes.isClosed = true
 
 	close(aes.stream)
 }
 
 // IsClosed is set to true if the event stream has been closed
 func (aes *asyncEventStream[T]) IsClosed() bool {
-	aes.m.Lock()
-	defer aes.m.Unlock()
-	return aes.isClosed
+	return aes.closed.Get()
 }
 
 // dispatchedEvent[T] is an event payload that is processed in the event dispatching loop.
 type dispatchedEvent[T any] struct {
 	event T
 	sent  chan struct{}
+}
+
+// closeEvent is used to communicate to the dispatcher to shutdown any existing event streams
+type closeEvent struct {
+	done chan struct{}
 }
 
 // eventStreamHandler[T] represents an event handler processor linked to an EventHandler[T]
@@ -99,22 +109,22 @@ type eventStreamHandler[T any] struct {
 // multicastDispatcher[T] is a channel based multicast dispatcher
 type multicastDispatcher[T any] struct {
 	in  chan *dispatchedEvent[T]
-	end chan struct{}
+	end chan *closeEvent
 
 	handlers    map[HandlerID]*eventStreamHandler[T]
 	handlerLock sync.Mutex
 
-	streams    []*asyncEventStream[T]
-	streamLock sync.Mutex
+	streams set[*asyncEventStream[T]]
 }
 
 // AddEventHandler adds a new event handler method that is called whenever an event T is dispatched. A
 // unique HandlerID is returned that can be used to remove the handler.
 func (md *multicastDispatcher[T]) AddEventHandler(handler EventHandler[T]) HandlerID {
+	handlerID := HandlerID(uuid.NewString())
 	stream := md.NewEventStream()
 
 	// create a new go routine event receive loop for the new event stream
-	go func() {
+	go func(id HandlerID) {
 		for event := range stream.Stream() {
 			err := md.executeHandler(handler, event)
 
@@ -124,9 +134,15 @@ func (md *multicastDispatcher[T]) AddEventHandler(handler EventHandler[T]) Handl
 				fmt.Fprintf(os.Stderr, "EventHandler Error: %s\n", err)
 			}
 		}
-	}()
 
-	handlerID := HandlerID(uuid.NewString())
+		// in the case the handler stream is closed via the dispatcher, the
+		// handler will still exist, so we'll need to remove here. If the
+		// handler was already removed, this will no-op.
+		md.handlerLock.Lock()
+		delete(md.handlers, id)
+		md.handlerLock.Unlock()
+	}(handlerID)
+
 	sHandler := &eventStreamHandler[T]{
 		id:     handlerID,
 		stream: stream,
@@ -180,58 +196,64 @@ func (md *multicastDispatcher[T]) Dispatch(event T) {
 	}
 }
 
+// NewEventStream returns an asynchronous event stream that can be used to receive dispatched events.
 func (md *multicastDispatcher[T]) NewEventStream() EventStream[T] {
-	md.streamLock.Lock()
-	defer md.streamLock.Unlock()
-
-	aes := &asyncEventStream[T]{
-		isClosed: false,
-		stream:   make(chan T),
-	}
-
-	md.streams = append(md.streams, aes)
+	aes := newAsyncEventStream[T]()
+	md.streams.Add(aes)
 	return aes
+}
+
+// CloseEventStreams closes all listening event streams and shuts down the dispatcher
+func (md *multicastDispatcher[T]) CloseEventStreams() {
+	done := make(chan struct{})
+	md.end <- &closeEvent{
+		done: done,
+	}
+	<-done
 }
 
 // newMulticastDispatcher creates a new Dispatcher[T]
 func newMulticastDispatcher[T any]() Dispatcher[T] {
 	in := make(chan *dispatchedEvent[T], 5)
-	end := make(chan struct{})
+	end := make(chan *closeEvent)
 
 	md := &multicastDispatcher[T]{
 		in:       in,
 		end:      end,
+		streams:  newSet[*asyncEventStream[T]](),
 		handlers: make(map[HandlerID]*eventStreamHandler[T]),
 	}
 
 	go func() {
 		for {
-			var evt *dispatchedEvent[T]
-
 			// Select on incoming event or a shutdown
 			select {
-			case evt = <-md.in:
-			case <-md.end:
-				md.streamLock.Lock()
-				for i := 0; i < len(md.streams); i++ {
-					md.streams[i].Close()
+			// incoming event
+			case evt := <-md.in:
+				// get the event streams to notify
+				streams := md.getEventStreams()
+				if len(streams) == 0 {
+					continue
 				}
-				md.streamLock.Unlock()
+
+				// check to see if the event sent over requires synchronization or not
+				if evt.sent == nil {
+					md.executeAsync(streams, evt)
+				} else {
+					md.executeSync(streams, evt)
+				}
+
+			// dispatcher closing
+			case closeEvt := <-md.end:
+				streams := md.streams.ToSlice()
+				for _, s := range streams {
+					s.Close()
+				}
+				md.streams.RemoveAll()
+				closeEvt.done <- struct{}{}
 				return
 			}
 
-			// get the event streams to notify
-			streams := md.getEventStreams()
-			if len(streams) == 0 {
-				continue
-			}
-
-			// check to see if the event sent over requires synchronization or not
-			if evt.sent == nil {
-				md.executeAsync(streams, evt)
-			} else {
-				md.executeSync(streams, evt)
-			}
 		}
 	}()
 
@@ -240,38 +262,17 @@ func newMulticastDispatcher[T any]() Dispatcher[T] {
 
 // getEventStreams returns an event stream list to notify.
 func (md *multicastDispatcher[T]) getEventStreams() []*asyncEventStream[T] {
-	md.streamLock.Lock()
-	if len(md.streams) == 0 {
-		md.streamLock.Unlock()
+	if md.streams.Length() == 0 {
 		return nil
 	}
 
 	// ensure that we remove all streams that are closed
-	// little note about this logic: we create a pointer to the
-	// same underlying array for ad.streams, then write only valid
-	// streams, then finally nil out any of the remaining indices
-	// and set the new streams pointer (it reuses the same memory to
-	// filter out closed streams)
-	validStreams := md.streams[:0]
-	for _, stream := range md.streams {
-		if !stream.IsClosed() {
-			validStreams = append(validStreams, stream)
-		}
-	}
+	md.streams.RemoveOn(func(stream *asyncEventStream[T]) bool {
+		return stream == nil || stream.IsClosed()
+	})
 
-	// nil out any leftover indexes, and update the slice
-	for i := len(validStreams); i < len(md.streams); i++ {
-		md.streams[i] = nil
-	}
-	md.streams = validStreams
-
-	// TODO: We should pool these scratch array copies so we don't have to
-	// TODO: allocate every time.
-	toNotify := make([]*asyncEventStream[T], len(md.streams))
-	copy(toNotify, md.streams)
-	md.streamLock.Unlock()
-
-	return toNotify
+	// return a slice containing the streams to dispatch to
+	return md.streams.ToSlice()
 }
 
 // executeAsync will create go routines to send the event to each stream and does not block
@@ -281,10 +282,10 @@ func (md *multicastDispatcher[T]) executeAsync(streams []*asyncEventStream[T], e
 		go func(stream *asyncEventStream[T]) {
 			defer func() {
 				if r := recover(); r != nil {
-					// FIXME: This will happen if events for the stream are queued and the stream is then closed.
-					// FIXME: Occurs due to a conflict caused by our design (allowing handlers to be externally
-					// FIXME: closed, which breaks go channel principles). We should look into a way to maintain
-					// FIXME: go principles and maintain our API.
+					// NOTE: This will happen if events for the stream are queued and the stream is then closed.
+					// NOTE: Occurs due to a conflict caused by our design (allowing handlers to be externally
+					// NOTE: closed, which breaks go channel principles). We should look into a way to maintain
+					// NOTE: go principles and maintain our API.
 				}
 			}()
 
@@ -307,9 +308,17 @@ func (md *multicastDispatcher[T]) executeSync(streams []*asyncEventStream[T], ev
 	var wg sync.WaitGroup
 	wg.Add(length)
 
-	for i := 0; i < len(streams); i++ {
+	for i := 0; i < length; i++ {
 		go func(stream *asyncEventStream[T]) {
-			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					// NOTE: This will happen if events for the stream are queued and the stream is then closed.
+					// NOTE: Occurs due to a conflict caused by our design (allowing handlers to be externally
+					// NOTE: closed, which breaks go channel principles). We should look into a way to maintain
+					// NOTE: go principles and maintain our API.
+				}
+				wg.Done()
+			}()
 
 			if stream.IsClosed() {
 				return
