@@ -25,6 +25,9 @@ type set[T comparable] interface {
 	// Has returns true if the item exists within the set. Otherwise, false.
 	Has(item T) bool
 
+	// Filtered returns a slice of items that match the predicate.
+	Filtered(func(T) bool) []T
+
 	// Length returns the total number of items in the set.
 	Length() int
 
@@ -129,6 +132,25 @@ func (s *lockingSet[T]) ToSlice() []T {
 	for k := range s.m {
 		slice[index] = k
 		index++
+	}
+	return slice
+}
+
+// Filtered returns a slice of items that match the predicate.
+func (s *lockingSet[T]) Filtered(predicate func(T) bool) []T {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	l := len(s.m)
+	if l == 0 {
+		return nil
+	}
+
+	var slice []T
+	for k := range s.m {
+		if predicate(k) {
+			slice = append(slice, k)
+		}
 	}
 	return slice
 }

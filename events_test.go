@@ -8,15 +8,48 @@ import (
 	"time"
 )
 
+//--------------------------------------------------------------------------
+//  TypedEventKind Enum
+//--------------------------------------------------------------------------
+
+// TypedEventKind is used as a filterable field for events.
+type TypedEventKind int
+
+const (
+	TypedEventKindOne TypedEventKind = iota
+	TypedEventKindTwo
+	TypedEventKindThree
+)
+
+//--------------------------------------------------------------------------
+//  Testing Data Structures
+//--------------------------------------------------------------------------
+
+// TestEvent is a simple message wrapper.
 type TestEvent struct {
 	Message string
 }
 
+// GenericTestEvent is a message and data wrapper.
+type GenericTestEvent[T any] struct {
+	Message string
+	Data    T
+}
+
+// TypedEvent is a message wrapper with a kind field used to test filtered dispatch.
+type TypedEvent struct {
+	Kind    TypedEventKind
+	Message string
+}
+
+// waitAndDispatch sleeps for the specified duration, then dispatches the event using the provided
+// dispatcher
 func waitAndDispatch[T any](dur time.Duration, dispatcher Dispatcher[T], event T) {
 	time.Sleep(dur)
 	dispatcher.Dispatch(event)
 }
 
+// waitChannelFor creates returns a channel that will send a signal when the waitgroup is done.
 func waitChannelFor(wg *sync.WaitGroup) <-chan struct{} {
 	ch := make(chan struct{})
 	go func() {
@@ -26,16 +59,30 @@ func waitChannelFor(wg *sync.WaitGroup) <-chan struct{} {
 	return ch
 }
 
-func strcmp[T comparable](t *testing.T, a, b T) {
+// cmp compares two comparable values and fails the test if they are not equal.
+func cmp[T comparable](t *testing.T, a, b T) {
 	if a != b {
 		t.Errorf("Expected %+v. Got: %+v", a, b)
 	}
 }
 
+// eventFilter returns a closure that can be used to filter events based on their kind.
+func eventFilter(kind TypedEventKind) EventCondition[TypedEvent] {
+	return func(event TypedEvent) bool {
+		return event.Kind == kind
+	}
+}
+
+//--------------------------------------------------------------------------
+//  Tests
+//--------------------------------------------------------------------------
+
 func TestTypeOf(t *testing.T) {
-	strcmp(t, typeOf[TestEvent](), "github.com/kubecost/events/TestEvent")
-	strcmp(t, typeOf[*TestEvent](), "*github.com/kubecost/events/TestEvent")
-	strcmp(t, typeOf[**TestEvent](), "**github.com/kubecost/events/TestEvent")
+	cmp(t, typeOf[TestEvent](), "github.com/kubecost/events/TestEvent")
+	cmp(t, typeOf[*TestEvent](), "*github.com/kubecost/events/TestEvent")
+	cmp(t, typeOf[**TestEvent](), "**github.com/kubecost/events/TestEvent")
+	cmp(t, typeOf[GenericTestEvent[string]](), "github.com/kubecost/events/GenericTestEvent[string]")
+	cmp(t, typeOf[GenericTestEvent[GenericTestEvent[string]]](), "github.com/kubecost/events/GenericTestEvent[events.GenericTestEvent[string]]")
 }
 
 func TestDispatchEventStream(t *testing.T) {
@@ -204,6 +251,177 @@ func TestAddRemoveHandlersMidStreamSync(t *testing.T) {
 	}
 }
 
+func TestFilteredEventStreams(t *testing.T) {
+	d := NewDispatcher[TypedEvent]()
+
+	var anyCount, oneCount, twoCount, threeCount uint32
+	var wg sync.WaitGroup
+	wg.Add(5)
+
+	var goFuncGroup sync.WaitGroup
+	goFuncGroup.Add(5)
+
+	go func() {
+		defer goFuncGroup.Done()
+
+		stream := d.NewFilteredEventStream(eventFilter(TypedEventKindOne))
+		wg.Done()
+
+		for event := range stream.Stream() {
+			atomic.AddUint32(&oneCount, 1)
+			t.Logf("One Handler: [Event %s]\n", event.Message)
+		}
+	}()
+
+	go func() {
+		defer goFuncGroup.Done()
+
+		stream := d.NewFilteredEventStream(eventFilter(TypedEventKindTwo))
+		wg.Done()
+
+		for event := range stream.Stream() {
+			atomic.AddUint32(&twoCount, 1)
+			t.Logf("Two Handler: [Event %s]\n", event.Message)
+		}
+	}()
+
+	go func() {
+		defer goFuncGroup.Done()
+
+		stream := d.NewFilteredEventStream(eventFilter(TypedEventKindThree))
+		wg.Done()
+
+		for event := range stream.Stream() {
+			atomic.AddUint32(&threeCount, 1)
+			t.Logf("Three Handler: [Event %s]\n", event.Message)
+		}
+	}()
+
+	go func() {
+		defer goFuncGroup.Done()
+
+		stream := d.NewFilteredEventStream(eventFilter(TypedEventKindThree))
+		wg.Done()
+
+		for event := range stream.Stream() {
+			atomic.AddUint32(&threeCount, 1)
+			t.Logf("Another Three Handler: [Event %s]\n", event.Message)
+		}
+	}()
+
+	go func() {
+		defer goFuncGroup.Done()
+
+		stream := d.NewEventStream()
+		wg.Done()
+
+		for event := range stream.Stream() {
+			atomic.AddUint32(&anyCount, 1)
+			t.Logf("Universal Handler: [Event %s]\n", event.Message)
+		}
+	}()
+
+	// wait until all of the event streams were added before dispatching
+	wg.Wait()
+
+	d.DispatchSync(TypedEvent{TypedEventKindOne, "One"})
+	d.DispatchSync(TypedEvent{TypedEventKindTwo, "Two"})
+	d.DispatchSync(TypedEvent{TypedEventKindThree, "Three"})
+
+	d.CloseEventStreams()
+	goFuncGroup.Wait()
+
+	if anyCount != 3 {
+		t.Errorf("Any Count != 3. Got: %d\n", anyCount)
+	}
+
+	if oneCount != 1 {
+		t.Errorf("One Count != 1. Got: %d\n", oneCount)
+	}
+
+	if twoCount != 1 {
+		t.Errorf("Two Count != 1. Got: %d\n", twoCount)
+	}
+
+	if threeCount != 2 {
+		t.Errorf("Three Count != 2. Got: %d\n", threeCount)
+	}
+}
+
+func TestAddFilteredHandlers(t *testing.T) {
+	d := NewDispatcher[TypedEvent]()
+
+	var handlerGroup sync.WaitGroup
+	handlerGroup.Add(5)
+
+	var handlers []HandlerID = make([]HandlerID, 5)
+	var anyCount, oneCount, twoCount, threeCount uint32
+
+	oneFilter := eventFilter(TypedEventKindOne)
+	twoFilter := eventFilter(TypedEventKindTwo)
+	threeFilter := eventFilter(TypedEventKindThree)
+
+	handlers[0] = d.AddFilteredEventHandler(func(event TypedEvent) {
+		atomic.AddUint32(&oneCount, 1)
+		t.Logf("One Handler: [Event %s]\n", event.Message)
+	}, oneFilter)
+
+	handlers[1] = d.AddFilteredEventHandler(func(event TypedEvent) {
+		atomic.AddUint32(&twoCount, 1)
+		t.Logf("Two Handler: [Event %s]\n", event.Message)
+	}, twoFilter)
+
+	handlers[2] = d.AddFilteredEventHandler(func(event TypedEvent) {
+		atomic.AddUint32(&threeCount, 1)
+		t.Logf("Three Handler: [Event %s]\n", event.Message)
+	}, threeFilter)
+
+	handlers[3] = d.AddFilteredEventHandler(func(event TypedEvent) {
+		atomic.AddUint32(&threeCount, 1)
+		t.Logf("Another Three Handler: [Event %s]\n", event.Message)
+	}, threeFilter)
+
+	handlers[4] = d.AddEventHandler(func(event TypedEvent) {
+		atomic.AddUint32(&anyCount, 1)
+		t.Logf("Universal Handler: [Event %s]\n", event.Message)
+	})
+
+	md := d.(*multicastDispatcher[TypedEvent])
+	for i := 0; i < len(handlers); i++ {
+		go func(onClose chan struct{}) {
+			defer handlerGroup.Done()
+			<-onClose
+		}(md.getHandlerClose(handlers[i]))
+	}
+
+	d.DispatchSync(TypedEvent{TypedEventKindOne, "One"})
+	d.DispatchSync(TypedEvent{TypedEventKindTwo, "Two"})
+	d.DispatchSync(TypedEvent{TypedEventKindThree, "Three"})
+
+	d.CloseEventStreams()
+	handlerGroup.Wait()
+
+	if anyCount != 3 {
+		t.Errorf("Any Count != 3. Got: %d\n", anyCount)
+	}
+
+	if oneCount != 1 {
+		t.Errorf("One Count != 1. Got: %d\n", oneCount)
+	}
+
+	if twoCount != 1 {
+		t.Errorf("Two Count != 1. Got: %d\n", twoCount)
+	}
+
+	if threeCount != 2 {
+		t.Errorf("Three Count != 2. Got: %d\n", threeCount)
+	}
+}
+
+//--------------------------------------------------------------------------
+//  Benchmarks
+//--------------------------------------------------------------------------
+
 // creates the dispatcher benchmark data structures
 func createDispatcherBenchmark[T any](numListeners int) (Dispatcher[T], []HandlerID, *sync.WaitGroup) {
 	var wg sync.WaitGroup
@@ -244,30 +462,3 @@ func BenchmarkDispatcher5(b *testing.B) { benchmarkDispatcher(5, b) }
 func BenchmarkDispatcher100(b *testing.B) { benchmarkDispatcher(100, b) }
 
 func BenchmarkDispatcher1000(b *testing.B) { benchmarkDispatcher(1000, b) }
-
-/*
-func TestStoredChan(t *testing.T) {
-	ch := make(chan int)
-
-	go func() {
-		ch <- 1
-	}()
-	go func() {
-		ch <- 2
-	}()
-
-	// wait a second to ensure both go routines have run and are pushing
-	// the int to the channel
-	time.Sleep(time.Second)
-
-	// Only pull one int from the channel
-	i := <-ch
-	t.Logf("I: %d\n", i)
-
-	// close the channel with the other being pushed on the channel
-	close(ch)
-
-	// wait, and it will panic
-	time.Sleep(2 * time.Second)
-}
-*/
