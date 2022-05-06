@@ -45,7 +45,7 @@ type Dispatcher[T any] interface {
 	// Dispatch broadcasts the T event to any subscribed listeners asynchronously.
 	Dispatch(event T)
 
-	// DispatchSync is a special dispatch scneario which will block if any listeners are not yet receiving
+	// DispatchSync is a special dispatch scenario which will block if any listeners are not yet receiving
 	// events. This should be used if you need to guarantee that all receivers are processing events before
 	// continuing. This method also has the added benefit of blocking until an event has been dispatched
 	// over all event streams before returning.
@@ -221,7 +221,7 @@ func (md *multicastDispatcher[T]) RemoveEventHandler(id HandlerID) bool {
 	return true
 }
 
-// DispatchSync is a special dispatch scneario which will block if any listeners are not yet receiving
+// DispatchSync is a special dispatch scenario which will block if any listeners are not yet receiving
 // events. This should be used if you need to guarantee that all receivers are processing events before
 // continuing. This method also has the added benefit of blocking until an event has been dispatched
 // over all event streams before returning.
