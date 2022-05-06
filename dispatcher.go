@@ -267,7 +267,7 @@ func (md *multicastDispatcher[T]) CloseEventStreams() {
 
 // newMulticastDispatcher creates a new Dispatcher[T]
 func newMulticastDispatcher[T any]() Dispatcher[T] {
-	in := make(chan *dispatchedEvent[T], 5)
+	in := make(chan *dispatchedEvent[T], 20)
 	end := make(chan *closeEvent)
 
 	md := &multicastDispatcher[T]{
