@@ -418,6 +418,64 @@ func TestAddFilteredHandlers(t *testing.T) {
 	}
 }
 
+func TestGlobalDispatcherCloseAllAndReuse(t *testing.T) {
+	var closeGroup sync.WaitGroup
+	var dispatchGroup sync.WaitGroup
+	var handlerGroup sync.WaitGroup
+
+	handlerGroup.Add(3)
+	dispatchGroup.Add(3)
+	closeGroup.Add(3)
+
+	d := GlobalDispatcherFor[TestEvent]()
+
+	for i := 0; i < 3; i++ {
+		s := d.NewEventStream()
+		go func(ii int, stream EventStream[TestEvent]) {
+			handlerGroup.Done()
+
+			for event := range stream.Stream() {
+				t.Logf("[%d] [%s]\n", ii, event.Message)
+				dispatchGroup.Done()
+			}
+			closeGroup.Done()
+		}(i, s)
+	}
+
+	handlerGroup.Wait()
+
+	// test events package dispatch convenience method
+	Dispatch(TestEvent{Message: "Test"})
+	dispatchGroup.Wait()
+
+	d.CloseEventStreams()
+
+	select {
+	case <-time.After(5 * time.Second):
+		t.Errorf("Test failed. Timed out after 5 seconds\n")
+	case <-waitChannelFor(&closeGroup):
+		t.Logf("Completed successfully\n")
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	d.AddEventHandler(func(te TestEvent) {
+		t.Logf("Global Handler: [%s]\n", te.Message)
+		wg.Done()
+	})
+
+	Dispatch(TestEvent{Message: "Test"})
+
+	select {
+	case <-time.After(5 * time.Second):
+		t.Errorf("Test failed. Timed out after 5 seconds\n")
+	case <-waitChannelFor(&wg):
+		t.Logf("Completed successfully\n")
+	}
+
+	d.CloseEventStreams()
+}
+
 //--------------------------------------------------------------------------
 //  Benchmarks
 //--------------------------------------------------------------------------

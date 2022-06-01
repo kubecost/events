@@ -266,7 +266,7 @@ func (md *multicastDispatcher[T]) CloseEventStreams() {
 }
 
 // newMulticastDispatcher creates a new Dispatcher[T]
-func newMulticastDispatcher[T any]() Dispatcher[T] {
+func newMulticastDispatcher[T any](persistent bool) Dispatcher[T] {
 	in := make(chan *dispatchedEvent[T], 20)
 	end := make(chan *closeEvent)
 
@@ -296,7 +296,7 @@ func newMulticastDispatcher[T any]() Dispatcher[T] {
 					md.executeSync(streams, evt)
 				}
 
-			// dispatcher closing
+			// non-persistent dispatcher closing
 			case closeEvt := <-md.end:
 				streams := md.streams.ToSlice()
 				for _, s := range streams {
@@ -304,7 +304,12 @@ func newMulticastDispatcher[T any]() Dispatcher[T] {
 				}
 				md.streams.RemoveAll()
 				closeEvt.done <- struct{}{}
-				return
+
+				// persistent dispatcher removes all handlers, but does
+				// not exit the processing goroutine
+				if !persistent {
+					return
+				}
 			}
 
 		}

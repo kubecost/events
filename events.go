@@ -47,13 +47,19 @@ func GlobalDispatcherFor[T any]() Dispatcher[T] {
 
 	key := typeOf[T]()
 	if _, ok := dispatchers[key]; !ok {
-		dispatchers[key] = newMulticastDispatcher[T]()
+		dispatchers[key] = newMulticastDispatcher[T](true)
 	}
 
 	return dispatchers[key].(Dispatcher[T])
 }
 
+// Dispatch is a convenience method which dispatches an event on the global dispatcher for a specific
+// T event type.
+func Dispatch[T any](event T) {
+	GlobalDispatcherFor[T]().Dispatch(event)
+}
+
 // NewDispatcher[T] creates a new multicast event dispatcher
 func NewDispatcher[T any]() Dispatcher[T] {
-	return newMulticastDispatcher[T]()
+	return newMulticastDispatcher[T](false)
 }

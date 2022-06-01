@@ -28,7 +28,7 @@ myEventDispatcher := events.NewDispatcher[MyEvent]()
 
 This will create a new dispatcher instance for the type `MyEvent`. Any events that dispatch over the instance will be received by any event handlers on that dispatcher only. Instanced dispatchers do not share event streams with the global dispatcher for that type. 
 
-Instanced dispatchers should also be closed when they are no longer needed. This will close any open event streams and remove any existing event handlers automatically. *NOTE*: Do not call `CloseEventStreams()` on a global dispatcher.
+Instanced dispatchers should also be closed when they are no longer needed. This will close any open event streams and remove any existing event handlers automatically. *NOTE:* Calling `CloseEventStreams()` on an instanced dispatcher will end that dispatchers lifecycle, disallowing any reuse. Calling `CloseEventStreams()` on a global dispatcher will remove all event handlers and close all event streams, but will not shutdown the dispatcher, and will allow it to be reused. 
 ```go
 type MyEvent struct {
     Message string 
