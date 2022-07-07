@@ -591,6 +591,60 @@ func TestDispatchSyncNoReceivers(t *testing.T) {
 	}
 }
 
+func TestBlockingSyncDispatch(t *testing.T) {
+	var complete sync.WaitGroup
+	complete.Add(1)
+
+	d := NewDispatcher[TestEvent]()
+
+	go func() {
+		defer complete.Done()
+
+		es := d.NewEventStream()
+		for syncEvent := range es.SyncStream() {
+			func() {
+				defer syncEvent.Done()
+
+				time.Sleep(2 * time.Second)
+				t.Logf("Finished waiting for sync event: %s\n", syncEvent.Event.Message)
+			}()
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	var didBlock sync.WaitGroup
+	didBlock.Add(1)
+
+	go func() {
+		d.DispatchSync(TestEvent{Message: "Test"})
+		didBlock.Done()
+	}()
+
+	start := time.Now()
+	select {
+	case <-waitChannelFor(&didBlock):
+	case <-time.After(3 * time.Second):
+	}
+
+	delta := time.Now().Sub(start)
+	if delta < (2 * time.Second) {
+		t.Errorf("Test failed. Blocked for less than 2 seconds: %dms\n", delta.Milliseconds())
+	}
+	if delta > (3 * time.Second) {
+		t.Errorf("Test failed. Blocked longer than 3 seconds: %dms\n", delta.Milliseconds())
+	}
+
+	d.CloseEventStreams()
+
+	select {
+	case <-waitChannelFor(&complete):
+	case <-time.After(1 * time.Second):
+		t.Errorf("Test failed. Timed out after 1 second\n")
+	}
+
+}
+
 //--------------------------------------------------------------------------
 //  Benchmarks
 //--------------------------------------------------------------------------
