@@ -542,7 +542,6 @@ func (md *multicastDispatcher[T]) executeSync(streams []*asyncEventStream[T], ev
 		go func(stream *asyncEventStream[T]) {
 			defer func() {
 				if r := recover(); r != nil {
-					fmt.Println("Panic!", r)
 					// This will happen if events for the stream are queued and the stream
 					// is then closed. Occurs due to a conflict caused by our design
 					// (allowing handlers to be externally closed, which breaks go channel
