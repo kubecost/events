@@ -42,14 +42,15 @@ type TypedEvent struct {
 	Message string
 }
 
-// waitAndDispatch sleeps for the specified duration, then dispatches the event using the provided
-// dispatcher
+// waitAndDispatch sleeps for the specified duration, then dispatches the event using the
+// provided dispatcher
 func waitAndDispatch[T any](dur time.Duration, dispatcher Dispatcher[T], event T) {
 	time.Sleep(dur)
 	dispatcher.Dispatch(event)
 }
 
-// waitChannelFor creates returns a channel that will send a signal when the waitgroup is done.
+// waitChannelFor creates returns a channel that will send a signal when the waitgroup is
+// done.
 func waitChannelFor(wg *sync.WaitGroup) <-chan struct{} {
 	ch := make(chan struct{})
 	go func() {
@@ -116,8 +117,8 @@ func TestSingleDispatcherMultipleHandlers(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	// for 10 events and 3 handlers, we'll expect to receive
-	// 30 total handler calls (10 events per handler)
+	// for 10 events and 3 handlers, we'll expect to receive 30 total handler calls (10
+	// events per handler)
 	wg.Add(3 * totalEvents)
 
 	d := NewDispatcher[TestEvent]()
@@ -279,9 +280,14 @@ func TestFilteredEventStreams(t *testing.T) {
 		stream := d.NewFilteredEventStream(eventFilter(TypedEventKindTwo))
 		wg.Done()
 
-		for event := range stream.Stream() {
-			atomic.AddUint32(&twoCount, 1)
-			t.Logf("Two Handler: [Event %s]\n", event.Message)
+		for syncEvent := range stream.SyncStream() {
+			func() {
+				defer syncEvent.Done()
+
+				event := syncEvent.Event
+				atomic.AddUint32(&twoCount, 1)
+				t.Logf("Two Handler: [Event %s]\n", event.Message)
+			}()
 		}
 	}()
 
@@ -291,9 +297,14 @@ func TestFilteredEventStreams(t *testing.T) {
 		stream := d.NewFilteredEventStream(eventFilter(TypedEventKindThree))
 		wg.Done()
 
-		for event := range stream.Stream() {
-			atomic.AddUint32(&threeCount, 1)
-			t.Logf("Three Handler: [Event %s]\n", event.Message)
+		for syncEvent := range stream.SyncStream() {
+			func() {
+				defer syncEvent.Done()
+
+				event := syncEvent.Event
+				atomic.AddUint32(&threeCount, 1)
+				t.Logf("Three Handler: [Event %s]\n", event.Message)
+			}()
 		}
 	}()
 
@@ -303,9 +314,14 @@ func TestFilteredEventStreams(t *testing.T) {
 		stream := d.NewFilteredEventStream(eventFilter(TypedEventKindThree))
 		wg.Done()
 
-		for event := range stream.Stream() {
-			atomic.AddUint32(&threeCount, 1)
-			t.Logf("Another Three Handler: [Event %s]\n", event.Message)
+		for syncEvent := range stream.SyncStream() {
+			func() {
+				defer syncEvent.Done()
+
+				event := syncEvent.Event
+				atomic.AddUint32(&threeCount, 1)
+				t.Logf("Another Three Handler: [Event %s]\n", event.Message)
+			}()
 		}
 	}()
 
@@ -315,9 +331,14 @@ func TestFilteredEventStreams(t *testing.T) {
 		stream := d.NewEventStream()
 		wg.Done()
 
-		for event := range stream.Stream() {
-			atomic.AddUint32(&anyCount, 1)
-			t.Logf("Universal Handler: [Event %s]\n", event.Message)
+		for syncEvent := range stream.SyncStream() {
+			func() {
+				defer syncEvent.Done()
+
+				event := syncEvent.Event
+				atomic.AddUint32(&anyCount, 1)
+				t.Logf("Universal Handler: [Event %s]\n", event.Message)
+			}()
 		}
 	}()
 
@@ -474,6 +495,100 @@ func TestGlobalDispatcherCloseAllAndReuse(t *testing.T) {
 	}
 
 	d.CloseEventStreams()
+}
+
+func TestSyncAndAsyncDispatch(t *testing.T) {
+	var totalHandled uint32 = 0
+
+	var wait sync.WaitGroup
+	wait.Add(2)
+
+	d := NewDispatcher[TestEvent]()
+
+	go func() {
+		wait.Done()
+
+		stream := d.NewEventStream()
+		for syncEvent := range stream.SyncStream() {
+			func() {
+				defer syncEvent.Done()
+				atomic.AddUint32(&totalHandled, 1)
+				t.Logf("Sync Receive: [%s]\n", syncEvent.Event.Message)
+			}()
+		}
+	}()
+
+	go func() {
+		wait.Done()
+
+		stream := d.NewEventStream()
+		for evt := range stream.Stream() {
+			atomic.AddUint32(&totalHandled, 1)
+			t.Logf("Async Receive: [%s]\n", evt.Message)
+		}
+	}()
+
+	wait.Wait()
+
+	for i := 0; i < 3; i++ {
+		if i != 1 {
+			d.Dispatch(TestEvent{Message: fmt.Sprintf("Regular Event: %d", i)})
+		} else {
+			d.DispatchSync(TestEvent{Message: fmt.Sprintf("Sync Event: %d", i)})
+		}
+	}
+
+	time.Sleep(1 * time.Second)
+	if totalHandled != 6 {
+		t.Errorf("Total Handled != 6. Got: %d\n", totalHandled)
+	}
+}
+
+func TestDispatchSyncWithTimeout(t *testing.T) {
+	var complete sync.WaitGroup
+	complete.Add(1)
+
+	d := NewDispatcher[TestEvent]()
+
+	go func() {
+		defer complete.Done()
+
+		es := d.NewEventStream()
+		for syncEvent := range es.SyncStream() {
+			t.Logf("I messed up and forgot to call Done() on the sync event: %s!\n", syncEvent.Event.Message)
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	d.DispatchSyncWithTimeout(TestEvent{Message: "Test"}, time.Second)
+	d.CloseEventStreams()
+
+	select {
+	case <-waitChannelFor(&complete):
+		t.Logf("Completed successfully\n")
+		return
+	case <-time.After(3 * time.Second):
+		t.Errorf("Test failed. Timed out after 3 seconds\n")
+	}
+}
+
+func TestDispatchSyncNoReceivers(t *testing.T) {
+	d := NewDispatcher[TestEvent]()
+
+	complete := make(chan struct{})
+	go func() {
+		d.DispatchSync(TestEvent{Message: "Test"})
+		complete <- struct{}{}
+	}()
+
+	select {
+	case <-complete:
+		t.Logf("Completed successfully\n")
+		return
+	case <-time.After(1 * time.Second):
+		t.Errorf("Test failed. Timed out after 1 second\n")
+	}
 }
 
 //--------------------------------------------------------------------------

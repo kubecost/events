@@ -71,8 +71,67 @@ dispatcher.Dispatch(MyEvent{Message: "Hello World!"})
 // Hello World!
 ```
 
+### Synchronous Dispatch and Receiving
+While the internals of the dispatching remain asynchronous, the API allows for event dispatchers to block until events are "received." This behavior depends on both the dispatcher and the event handler. If I add an event stream handler like in the previous example:
+
+```go
+dispatcher := events.NewDispatcher[MyEvent]()
+
+// typically, a stream will be handled in a separate goroutine
+go func() {
+    stream := dispatcher.NewEventStream()
+
+    for event := range stream.Stream() {
+        fmt.Println(event.Message)
+    }
+}()
+```
+
+Then, this receiver will _always_ receive and handle events asynchronously. If you were dispatch an event using the `DispatchSync(...)` method on `Dispatcher`, the dispatcher will block *until the event is dispatched to the receiver*. However, what you wanted the `DispatchSync(...)` to block until the event is received and handled? For this, you will need to change the range loop in your handler slightly:
+
+```go
+go func() {
+    // This line is the same
+    stream := dispatcher.NewEventStream()
+
+
+    // We changed the variable name to `syncEvent` and we changed the method from `Stream()` to `SyncStream()`
+    for syncEvent := range stream.SyncStream() {
+        // As a convention, to _ensure_ that `syncEvent.Done()` is called when the event is handled, we can
+        // wrap our handling code in an anonymous function, and use `defer syncEvent.Done()`. 
+        func() {
+            // Notifies the dispatcher that the event has been handled.
+            defer syncEvent.Done()
+
+            // The `Event` field contains the event that was dispatched 
+            event := syncEvent.Event
+            fmt.Println(event.Message)
+        }()
+    }
+}()
+```
+
+*NOTE* The `syncEvent.Done()` call is important, as it ensures that the dispatcher will not block indefinitely. This can be called at any point in the handling of the `SyncEvent[T]`, but it's best to defer the call within an anonymous function to ensure that it is called. It's also very important to be weary of potential panics in your handling code (another good reason to use defer). If being cautious in a handler is not possible, and you wish to avoid the potential to block and leak goroutines, you can use `DispatchSyncWithTimeout(event T, timeout time.Duration)` to dispatch an event which will never block longer than the specified amount of time. 
+
+To summarize, if you want to use synchronous dispatch and handling, you would use: 
+* `dispatcher.DispatchSync()` or `dispatcher.DispatchSyncWithTimeout()` to dispatch an event
+* `eventStream.SyncStream()` to receive the event, and make sure to call `syncEvent.Done()` when the event is handled.
+
+If you only want the dispatcher to block until the event is dispatched, you can use:
+* `dispatcher.DispatchSync()` or `dispatcher.DispatchSyncWithTimeout()` to dispatch an event
+* `eventStream.Stream()` to receive the event where the event arrives directly on the stream
+
+If you want no blocking behavior, use: 
+* `dispatcher.Dispatch()` to dispatch an event
+* `eventStream.Stream()` to receive the event where the event arrives directly on the stream.
+
+The other possible combination would occur if you used `SyncStream()` on the `EventStream`, and then used `Dispatch()` on the `Dispatcher`. This behaves similarly to the non-blocking behavior. 
+
+This means that no matter what, an event stream will always receive a dispatched event, whether that dispatch was made using `Dispatch` or `DispatchSync`. 
+
+
 ### Event Handlers
-Event handlers are an abstraction over the event streams, and provide a simpler way to listen to events via function receivers.
+Event handlers are an abstraction over the event streams, and provide a simpler way to listen to events via function receivers. Note that Event Handlers behave identically to using an asynchronous `EventStream`. That is, handlers are always asynchronous receivers (there is not currently a synchronous event handler API):
 
 ```go
 type MyEvent struct {

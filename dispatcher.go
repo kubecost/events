@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -12,14 +13,15 @@ import (
 //  Alias Types
 //--------------------------------------------------------------------------
 
-// HandlerID is a unique identifier assigned to a provided event handler. This is used to remove a handler
-// from the dispatcher when it is no longer needed.
+// HandlerID is a unique identifier assigned to a provided event handler. This is used to
+// remove a handler from the dispatcher when it is no longer needed.
 type HandlerID string
 
 // EventHandler[T] is a type used to receive events from a dispatcher.
 type EventHandler[T any] func(T)
 
-// EventCondition[T] is a type used to filter events that are dispatched to a specific handler.
+// EventCondition[T] is a type used to filter events that are dispatched to a specific
+// handler.
 type EventCondition[T any] func(T) bool
 
 //--------------------------------------------------------------------------
@@ -31,6 +33,11 @@ type EventCondition[T any] func(T) bool
 type EventStream[T any] interface {
 	// Stream returns access to the event T channel where events will arrive.
 	Stream() <-chan T
+
+	// SyncStream returns a channel that receives SyncEvent[T] instances containing the
+	// event T payload and a channel to signal when the event is processed. This channel
+	// *ONLY* receives events that are dispatched with DispatchSync.
+	SyncStream() <-chan SyncEvent[T]
 
 	// Close shuts down the event stream, closing the channel
 	Close()
@@ -45,36 +52,85 @@ type Dispatcher[T any] interface {
 	// Dispatch broadcasts the T event to any subscribed listeners asynchronously.
 	Dispatch(event T)
 
-	// DispatchSync is a special dispatch scenario which will block if any listeners are not yet receiving
-	// events. This should be used if you need to guarantee that all receivers are processing events before
-	// continuing. This method also has the added benefit of blocking until an event has been dispatched
-	// over all event streams before returning.
+	// DispatchSync is a special dispatch scenario which will block if any listeners are not
+	// yet receiving events. This should be used if you need to guarantee that all receivers
+	// are processing events before continuing. This method also has the added benefit of
+	// blocking until an event has been dispatched over all event streams before returning.
 	DispatchSync(event T)
 
-	// AddEventHandler adds a new event handler method that is called whenever an event T is dispatched. A
-	// unique HandlerID is returned that can be used to remove the handler.
+	// DispatchSyncWithTimeout performs the same operation as `DispatchSync` but will
+	// timeout if dispatching takes longer than the provided duration.
+	DispatchSyncWithTimeout(event T, timeout time.Duration)
+
+	// AddEventHandler adds a new event handler method that is called whenever an event T is
+	// dispatched. A unique HandlerID is returned that can be used to remove the handler.
 	AddEventHandler(handler EventHandler[T]) HandlerID
 
-	// AddFilteredEventHandler adds a new event handler method that is called whenever a dispatched event T
-	// passes the provided condition. A unique HandlerID is returned that can be used to remove the handler.
-	// Note that the condition will be checked prior to dispatch, which is more performant than filtering
-	// in the event handler itself.
+	// AddFilteredEventHandler adds a new event handler method that is called whenever a
+	// dispatched event T passes the provided condition. A unique HandlerID is returned that
+	// can be used to remove the handler. Note that the condition will be checked prior to
+	// dispatch, which is more performant than filtering in the event handler itself.
 	AddFilteredEventHandler(handler EventHandler[T], condition EventCondition[T]) HandlerID
 
-	// RemoveEventHandler removes an event handler that was added via AddEventHandler using it's HandlerID.
-	// Returns true if the handler was successfully removed.
+	// RemoveEventHandler removes an event handler that was added via AddEventHandler using
+	// it's HandlerID. Returns true if the handler was successfully removed.
 	RemoveEventHandler(id HandlerID) bool
 
-	// NewEventStream returns an asynchronous event stream that can be used to receive dispatched events.
+	// NewEventStream returns an asynchronous event stream that can be used to receive
+	// dispatched events.
 	NewEventStream() EventStream[T]
 
-	// NewFilteredEventStream creates a new event stream that will only receive events that match the provided
-	// condition. Note that the condition will be checked prior to dispatch, which is more performant than
-	// filtering in the event handler itself.
+	// NewFilteredEventStream creates a new event stream that will only receive events that
+	// match the provided condition. Note that the condition will be checked prior to
+	// dispatch, which is more performant than filtering in the event handler itself.
 	NewFilteredEventStream(condition EventCondition[T]) EventStream[T]
 
 	// CloseEventStreams closes all listening event streams and shuts down the dispatcher
 	CloseEventStreams()
+}
+
+//--------------------------------------------------------------------------
+//  EventStream[T] Helpers
+//--------------------------------------------------------------------------
+
+// SyncEvent[T] is an event wrapper which contains the event T payload and a channel to
+// signal when the event is processed.
+type SyncEvent[T any] struct {
+	closed *atomicbool
+	done   chan struct{}
+
+	// Event contains the T event payload that was dispatched.
+	Event T
+}
+
+// Done notifies the event system that the event has been processed by the receiver.
+func (se *SyncEvent[T]) Done() {
+	if !se.closed.CompareAndSet(false, true) {
+		return
+	}
+
+	if se.done != nil {
+		close(se.done)
+	}
+}
+
+// creates a new synchronous event wrapper to pass to the synchronous event stream.
+func newSyncEvent[T any](event T) SyncEvent[T] {
+	return SyncEvent[T]{
+		closed: newAtomicBool(false),
+		done:   make(chan struct{}),
+		Event:  event,
+	}
+}
+
+// creates a new faux sync event, which is used when there exists a synchronous receiver for
+// an event dispatched asynchronously
+func newFauxSyncEvent[T any](event T) SyncEvent[T] {
+	return SyncEvent[T]{
+		closed: newAtomicBool(false),
+		done:   nil,
+		Event:  event,
+	}
 }
 
 //--------------------------------------------------------------------------
@@ -83,23 +139,52 @@ type Dispatcher[T any] interface {
 
 // asyncEventStream contains the event stream channel and metadata
 type asyncEventStream[T any] struct {
-	stream    chan T
-	closed    *atomicbool
-	condition EventCondition[T]
+	stream     chan T
+	syncStream chan SyncEvent[T]
+	closed     *atomicbool
+	accessed   *atomicbool
+	sync       *atomicbool
+	condition  EventCondition[T]
 }
 
 // newAsyncEventStream creates a new asynchronous event stream for a listener.
 func newAsyncEventStream[T any](condition EventCondition[T]) *asyncEventStream[T] {
 	return &asyncEventStream[T]{
-		closed:    newAtomicBool(false),
-		stream:    make(chan T),
-		condition: condition,
+		accessed:   newAtomicBool(false),
+		sync:       newAtomicBool(false),
+		closed:     newAtomicBool(false),
+		stream:     make(chan T),
+		syncStream: make(chan SyncEvent[T]),
+		condition:  condition,
 	}
 }
 
 // Stream returns access to the event T channel where events will arrive.
 func (aes *asyncEventStream[T]) Stream() <-chan T {
+	if aes.accessed.CompareAndSet(false, true) {
+		aes.sync.Set(false)
+	}
+
+	if aes.sync.Get() {
+		return nil
+	}
+
 	return aes.stream
+}
+
+// SyncStream returns a channel that receives SyncEvent[T] instances containing the event T
+// payload and a channel to signal when the event is processed. This channel *ONLY* receives
+// events that are dispatched with DispatchSync.
+func (aes *asyncEventStream[T]) SyncStream() <-chan SyncEvent[T] {
+	if aes.accessed.CompareAndSet(false, true) {
+		aes.sync.Set(true)
+	}
+
+	if !aes.sync.Get() {
+		return nil
+	}
+
+	return aes.syncStream
 }
 
 // Close shuts down the event stream, closing the channel
@@ -109,6 +194,7 @@ func (aes *asyncEventStream[T]) Close() {
 	}
 
 	close(aes.stream)
+	close(aes.syncStream)
 }
 
 // IsClosed is set to true if the event stream has been closed
@@ -122,11 +208,13 @@ func (aes *asyncEventStream[T]) IsClosed() bool {
 
 // dispatchedEvent[T] is an event payload that is processed in the event dispatching loop.
 type dispatchedEvent[T any] struct {
-	event T
-	sent  chan struct{}
+	event   T
+	sent    chan struct{}
+	timeout time.Duration
 }
 
-// closeEvent is used to communicate to the dispatcher to shutdown any existing event streams
+// closeEvent is used to communicate to the dispatcher to shutdown any existing event
+// streams
 type closeEvent struct {
 	done chan struct{}
 }
@@ -154,40 +242,48 @@ type multicastDispatcher[T any] struct {
 	streams set[*asyncEventStream[T]]
 }
 
-// AddEventHandler adds a new event handler method that is called whenever an event T is dispatched. A
-// unique HandlerID is returned that can be used to remove the handler.
+// AddEventHandler adds a new event handler method that is called whenever an event T is
+// dispatched. A unique HandlerID is returned that can be used to remove the handler.
 func (md *multicastDispatcher[T]) AddEventHandler(handler EventHandler[T]) HandlerID {
 	return md.AddFilteredEventHandler(handler, nil)
 }
 
-// AddFilteredEventHandler adds a new event handler method that is called whenever a dispatched event T
-// passes the provided condition. A unique HandlerID is returned that can be used to remove the handler.
+// AddFilteredEventHandler adds a new event handler method that is called whenever a
+// dispatched event T passes the provided condition. A unique HandlerID is returned that can
+// be used to remove the handler.
 func (md *multicastDispatcher[T]) AddFilteredEventHandler(handler EventHandler[T], condition EventCondition[T]) HandlerID {
 	handlerID := HandlerID(uuid.NewString())
 	stream := md.NewFilteredEventStream(condition)
 	onClose := make(chan struct{})
 
+	ch := make(chan struct{})
+
 	// create a new go routine event receive loop for the new event stream
 	go func(id HandlerID) {
 		defer close(onClose)
 
+		// notify the handler goroutine was added
+		ch <- struct{}{}
+
 		for event := range stream.Stream() {
 			err := md.executeHandler(handler, event)
 
-			// TODO: Pipe any errors that occur to an external handler rather than
-			// TODO: dumping directly to stderr
+			// TODO: Pipe any errors that occur to an external handler rather than TODO:
+			// dumping directly to stderr
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "EventHandler Error: %s\n", err)
 			}
 		}
 
-		// in the case the handler stream is closed via the dispatcher, the
-		// handler will still exist, so we'll need to remove here. If the
-		// handler was already removed, this will no-op.
+		// in the case the handler stream is closed via the dispatcher, the handler will
+		// still exist, so we'll need to remove here. If the handler was already removed,
+		// this will no-op.
 		md.handlerLock.Lock()
 		delete(md.handlers, id)
 		md.handlerLock.Unlock()
 	}(handlerID)
+
+	<-ch
 
 	sHandler := &eventStreamHandler[T]{
 		id:      handlerID,
@@ -202,8 +298,8 @@ func (md *multicastDispatcher[T]) AddFilteredEventHandler(handler EventHandler[T
 	return handlerID
 }
 
-// RemoveEventHandler removes an event handler that was added via AddEventHandler using it's HandlerID.
-// Returns true if the handler was successfully removed.
+// RemoveEventHandler removes an event handler that was added via AddEventHandler using it's
+// HandlerID. Returns true if the handler was successfully removed.
 func (md *multicastDispatcher[T]) RemoveEventHandler(id HandlerID) bool {
 	md.handlerLock.Lock()
 	handler, ok := md.handlers[id]
@@ -221,35 +317,59 @@ func (md *multicastDispatcher[T]) RemoveEventHandler(id HandlerID) bool {
 	return true
 }
 
-// DispatchSync is a special dispatch scenario which will block if any listeners are not yet receiving
-// events. This should be used if you need to guarantee that all receivers are processing events before
-// continuing. This method also has the added benefit of blocking until an event has been dispatched
-// over all event streams before returning.
+// DispatchSync is a special dispatch scenario which will block if any listeners are not yet
+// receiving events. This should be used if you need to guarantee that all receivers are
+// processing events before continuing. This method also has the added benefit of blocking
+// until an event has been dispatched over all event streams before returning.
 func (md *multicastDispatcher[T]) DispatchSync(event T) {
 	sent := make(chan struct{})
 
 	md.in <- &dispatchedEvent[T]{
-		event: event,
-		sent:  sent,
+		event:   event,
+		sent:    sent,
+		timeout: 0,
 	}
 
 	<-sent
 }
 
-// Dispatch executes an asynchronous dispatch of the provided T event.
-func (md *multicastDispatcher[T]) Dispatch(event T) {
+// DispatchSyncWithTimeout performs the same operation as `DispatchSync` but will timeout if
+// dispatching takes longer than the provided duration.
+func (md *multicastDispatcher[T]) DispatchSyncWithTimeout(event T, timeout time.Duration) {
+	sent := make(chan struct{})
+
 	md.in <- &dispatchedEvent[T]{
-		event: event,
+		event:   event,
+		sent:    sent,
+		timeout: timeout,
+	}
+
+	// we will block until the event is sent or the timeout is reached
+	// here as well as internally in the event processing loop
+	t := time.NewTimer(timeout)
+	select {
+	case <-sent:
+		t.Stop()
+	case <-t.C:
 	}
 }
 
-// NewEventStream returns an asynchronous event stream that can be used to receive dispatched events.
+// Dispatch executes an asynchronous dispatch of the provided T event.
+func (md *multicastDispatcher[T]) Dispatch(event T) {
+	md.in <- &dispatchedEvent[T]{
+		event:   event,
+		timeout: 0,
+	}
+}
+
+// NewEventStream returns an asynchronous event stream that can be used to receive
+// dispatched events.
 func (md *multicastDispatcher[T]) NewEventStream() EventStream[T] {
 	return md.NewFilteredEventStream(nil)
 }
 
-// NewFilteredEventStream creates a new event stream that will only receive events that match the provided
-// condition.
+// NewFilteredEventStream creates a new event stream that will only receive events that
+// match the provided condition.
 func (md *multicastDispatcher[T]) NewFilteredEventStream(condition EventCondition[T]) EventStream[T] {
 	aes := newAsyncEventStream(condition)
 	md.streams.Add(aes)
@@ -286,6 +406,10 @@ func newMulticastDispatcher[T any](persistent bool) Dispatcher[T] {
 				// get the event streams to notify
 				streams := md.getFilteredEventStreams(evt.event)
 				if len(streams) == 0 {
+					if evt.sent != nil {
+						evt.sent <- struct{}{}
+					}
+
 					continue
 				}
 
@@ -293,7 +417,11 @@ func newMulticastDispatcher[T any](persistent bool) Dispatcher[T] {
 				if evt.sent == nil {
 					md.executeAsync(streams, evt)
 				} else {
-					md.executeSync(streams, evt)
+					// execute sync handlers on a separate goroutine to avoid
+					// blocking the core dispatcher loop -- synchronous dispatch
+					// will appropriately block the dispatch-sync caller, but should
+					// NOT block the dispatch loop
+					go md.executeSync(streams, evt)
 				}
 
 			// non-persistent dispatcher closing
@@ -305,8 +433,8 @@ func newMulticastDispatcher[T any](persistent bool) Dispatcher[T] {
 				md.streams.RemoveAll()
 				closeEvt.done <- struct{}{}
 
-				// persistent dispatcher removes all handlers, but does
-				// not exit the processing goroutine
+				// persistent dispatcher removes all handlers, but does not exit the
+				// processing goroutine
 				if !persistent {
 					return
 				}
@@ -333,8 +461,8 @@ func (md *multicastDispatcher[T]) getEventStreams() []*asyncEventStream[T] {
 	return md.streams.ToSlice()
 }
 
-// getFilteredEventStreams returns a slice of event streams that match conditions for the provided
-// event
+// getFilteredEventStreams returns a slice of event streams that match conditions for the
+// provided event
 func (md *multicastDispatcher[T]) getFilteredEventStreams(event T) []*asyncEventStream[T] {
 	if md.streams.Length() == 0 {
 		return nil
@@ -371,26 +499,39 @@ func (md *multicastDispatcher[T]) executeAsync(streams []*asyncEventStream[T], e
 		go func(stream *asyncEventStream[T]) {
 			defer func() {
 				if r := recover(); r != nil {
-					// NOTE: This will happen if events for the stream are queued and the stream is then closed.
-					// NOTE: Occurs due to a conflict caused by our design (allowing handlers to be externally
-					// NOTE: closed, which breaks go channel principles). We should look into a way to maintain
-					// NOTE: go principles and maintain our API.
+					// This will happen if events for the stream are queued and the stream
+					// is then closed. Occurs due to a conflict caused by our design
+					// (allowing handlers to be externally closed, which breaks go channel
+					// principles). We should look into a way to maintain go principles and
+					// maintain our API.
 				}
 			}()
 
-			// stream can still be closed after this check, so we use the panic recover above for the last line
-			// of defense
+			// stream can still be closed after this check, so we use the panic recover
+			// above for the last line of defense
 			if stream.IsClosed() {
 				return
 			}
 
-			stream.stream <- evt.event
+			// Ensure that the event stream has been accessed before sending an event. This
+			// prevents go routines from leaking on asynchronous dispatch.
+			if stream.accessed.Get() {
+				// For synchronous receivers using an async dispatch, we still want to send
+				// an event, but we won't block the dispatching go routine.
+				if stream.sync.Get() {
+					syncEvent := newFauxSyncEvent(evt.event)
+					stream.syncStream <- syncEvent
+					// we do not wait for an async dispatch to a synchronous receiver
+				} else {
+					stream.stream <- evt.event
+				}
+			}
 		}(streams[i])
 	}
 }
 
-// executeSync will create go routines to send the event to each stream and _blocks_ when a receiver
-// doesn't exist.
+// executeSync will create go routines to send the event to each stream and _blocks_ when a
+// receiver doesn't exist.
 func (md *multicastDispatcher[T]) executeSync(streams []*asyncEventStream[T], evt *dispatchedEvent[T]) {
 	length := len(streams)
 
@@ -401,10 +542,12 @@ func (md *multicastDispatcher[T]) executeSync(streams []*asyncEventStream[T], ev
 		go func(stream *asyncEventStream[T]) {
 			defer func() {
 				if r := recover(); r != nil {
-					// NOTE: This will happen if events for the stream are queued and the stream is then closed.
-					// NOTE: Occurs due to a conflict caused by our design (allowing handlers to be externally
-					// NOTE: closed, which breaks go channel principles). We should look into a way to maintain
-					// NOTE: go principles and maintain our API.
+					fmt.Println("Panic!", r)
+					// This will happen if events for the stream are queued and the stream
+					// is then closed. Occurs due to a conflict caused by our design
+					// (allowing handlers to be externally closed, which breaks go channel
+					// principles). We should look into a way to maintain go principles and
+					// maintain our API.
 				}
 				wg.Done()
 			}()
@@ -413,7 +556,37 @@ func (md *multicastDispatcher[T]) executeSync(streams []*asyncEventStream[T], ev
 				return
 			}
 
-			stream.stream <- evt.event
+			// Ensure that the event stream has been accessed before sending an event. This
+			// is to ensure that synchronous events do not wait for a receiver that doesn't
+			// exist, and prevents go routines from leaking.
+			if stream.accessed.Get() {
+				// When an event stream has been accessed, we also know whether or not
+				// it is synchronous. This changes the behavior of the dispatch-sync
+				// to now wait for the receiver to notify us that it is done before
+				// continuing.
+				if stream.sync.Get() {
+					syncEvent := newSyncEvent(evt.event)
+					stream.syncStream <- syncEvent
+
+					// if we included a non-zero timeout, set it here
+					if evt.timeout != 0 {
+						t := time.NewTimer(evt.timeout)
+						select {
+						// synchronous event was effectively handled and signaled
+						case <-syncEvent.done:
+							t.Stop()
+							return
+						// timeout occurred before the event could be signaled
+						case <-t.C:
+						}
+					} else {
+						// otherwise, wait on the event to be signaled
+						<-syncEvent.done
+					}
+				} else {
+					stream.stream <- evt.event
+				}
+			}
 		}(streams[i])
 	}
 
@@ -423,8 +596,8 @@ func (md *multicastDispatcher[T]) executeSync(streams []*asyncEventStream[T], ev
 	evt.sent <- struct{}{}
 }
 
-// executeHandler provides a sandbox for handlers to execute, allowing panics that occur in handlers to be
-// caught and propagated as errors.
+// executeHandler provides a sandbox for handlers to execute, allowing panics that occur in
+// handlers to be caught and propagated as errors.
 func (md *multicastDispatcher[T]) executeHandler(handler EventHandler[T], event T) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
