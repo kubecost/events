@@ -87,7 +87,7 @@ go func() {
 }()
 ```
 
-Then, this receiver will _always_ receive and handle events asynchronously. If you were dispatch an event using the `DispatchSync(...)` method on `Dispatcher`, the dispatcher will block *until the event is dispatched to the receiver*. However, what you wanted the `DispatchSync(...)` to block until the event is received and handled? For this, you will need to change the range loop in your handler slightly:
+Then, this receiver will _always_ receive and handle events asynchronously. If you were dispatch an event using the `DispatchSync(...)` method on `Dispatcher`, the dispatcher will block *until the event is dispatched to the receiver*. However, what if you wanted the `DispatchSync(...)` to block until the event is received and handled? For this, you will need to change the range loop in your handler slightly:
 
 ```go
 go func() {
