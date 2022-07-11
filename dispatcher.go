@@ -166,22 +166,27 @@ func (aes *asyncEventStream[T]) Stream() <-chan T {
 	}
 
 	if aes.sync.Get() {
-		return nil
+		// NOTE: Returning a nil channel here would be preferable, but golang will indefinitely block
+		// NOTE: when range looping over a nil channel:
+		// NOTE: https://groups.google.com/g/golang-nuts/c/QltQ0nd9HvE/m/4TR-Bw1xbX8J
+		panic("EventStream.SyncStream() was already accessed. No longer allowed to access Stream()")
 	}
 
 	return aes.stream
 }
 
 // SyncStream returns a channel that receives SyncEvent[T] instances containing the event T
-// payload and a channel to signal when the event is processed. This channel *ONLY* receives
-// events that are dispatched with DispatchSync.
+// payload and a channel to signal when the event is processed.
 func (aes *asyncEventStream[T]) SyncStream() <-chan SyncEvent[T] {
 	if aes.accessed.CompareAndSet(false, true) {
 		aes.sync.Set(true)
 	}
 
 	if !aes.sync.Get() {
-		return nil
+		// NOTE: Returning a nil channel here would be preferable, but golang will indefinitely block
+		// NOTE: when range looping over a nil channel:
+		// NOTE: https://groups.google.com/g/golang-nuts/c/QltQ0nd9HvE/m/4TR-Bw1xbX8J
+		panic("EventStream.Stream() was already accessed. No longer allowed to access SyncStream()")
 	}
 
 	return aes.syncStream
@@ -574,7 +579,6 @@ func (md *multicastDispatcher[T]) executeSync(streams []*asyncEventStream[T], ev
 						// synchronous event was effectively handled and signaled
 						case <-syncEvent.done:
 							t.Stop()
-							return
 						// timeout occurred before the event could be signaled
 						case <-t.C:
 						}

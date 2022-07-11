@@ -645,6 +645,50 @@ func TestBlockingSyncDispatch(t *testing.T) {
 
 }
 
+func TestStreamAccessSwitching(t *testing.T) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	d := NewDispatcher[TestEvent]()
+
+	// we requested an event stream and accessed the async stream
+	es := d.NewEventStream()
+	stream := es.Stream()
+
+	go func() {
+		// now, we access the sync stream (this is not-allowed, should immediately exit go routine)
+		for evt := range stream {
+			t.Logf("Async Receive: [%s]\n", evt.Message)
+		}
+	}()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Logf("Recovered: %s\n", r)
+			}
+
+			wg.Done()
+		}()
+
+		syncStream := es.SyncStream()
+		// now, we access the sync stream (this is not-allowed, should immediately exit go routine)
+		for syncEvent := range syncStream {
+			func() {
+				defer syncEvent.Done()
+				t.Errorf("Sync Event received on async stream: %s\n", syncEvent.Event.Message)
+			}()
+		}
+		t.Logf("Done\n")
+	}()
+
+	select {
+	case <-waitChannelFor(&wg):
+	case <-time.After(1 * time.Second):
+		t.Errorf("Failed to exit sync stream in time!")
+	}
+}
+
 //--------------------------------------------------------------------------
 //  Benchmarks
 //--------------------------------------------------------------------------
