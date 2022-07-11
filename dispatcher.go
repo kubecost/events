@@ -104,6 +104,10 @@ type SyncEvent[T any] struct {
 
 // Done notifies the event system that the event has been processed by the receiver.
 func (se *SyncEvent[T]) Done() {
+	if se.closed == nil {
+		return
+	}
+
 	if !se.closed.CompareAndSet(false, true) {
 		return
 	}
