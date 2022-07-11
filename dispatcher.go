@@ -35,8 +35,7 @@ type EventStream[T any] interface {
 	Stream() <-chan T
 
 	// SyncStream returns a channel that receives SyncEvent[T] instances containing the
-	// event T payload and a channel to signal when the event is processed. This channel
-	// *ONLY* receives events that are dispatched with DispatchSync.
+	// event T payload and a channel to signal when the event is processed.
 	SyncStream() <-chan SyncEvent[T]
 
 	// Close shuts down the event stream, closing the channel
