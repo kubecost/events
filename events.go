@@ -8,8 +8,9 @@ import (
 )
 
 var (
-	lock        sync.Mutex
-	dispatchers map[string]any
+	lock         sync.Mutex
+	dispatchers  map[string]any
+	dispatchers2 map[reflect.Type]any
 )
 
 func init() {
@@ -26,7 +27,7 @@ func typeOf[T any]() string {
 
 	// pointer types do not carry the adequate type information, so we need to extract the
 	// underlying types until we reach the non-pointer type, we prepend a * each depth
-	for t != nil && t.Kind() == reflect.Ptr {
+	for t != nil && t.Kind() == reflect.Pointer {
 		prefix += "*"
 		t = t.Elem()
 	}

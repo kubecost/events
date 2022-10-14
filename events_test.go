@@ -61,9 +61,9 @@ func waitChannelFor(wg *sync.WaitGroup) <-chan struct{} {
 }
 
 // cmp compares two comparable values and fails the test if they are not equal.
-func cmp[T comparable](t *testing.T, a, b T) {
-	if a != b {
-		t.Errorf("Expected %+v. Got: %+v", a, b)
+func cmp[T comparable](t *testing.T, result, expected T) {
+	if result != expected {
+		t.Errorf("Expected: %+v. Got: %+v", expected, result)
 	}
 }
 
@@ -79,11 +79,19 @@ func eventFilter(kind TypedEventKind) EventCondition[TypedEvent] {
 //--------------------------------------------------------------------------
 
 func TestTypeOf(t *testing.T) {
-	cmp(t, typeOf[TestEvent](), "github.com/kubecost/events/TestEvent")
-	cmp(t, typeOf[*TestEvent](), "*github.com/kubecost/events/TestEvent")
-	cmp(t, typeOf[**TestEvent](), "**github.com/kubecost/events/TestEvent")
-	cmp(t, typeOf[GenericTestEvent[string]](), "github.com/kubecost/events/GenericTestEvent[string]")
-	cmp(t, typeOf[GenericTestEvent[GenericTestEvent[string]]](), "github.com/kubecost/events/GenericTestEvent[events.GenericTestEvent[string]]")
+	const packageName = "github.com/kubecost/events"
+	const testEventName = packageName + "/TestEvent"
+	const genericTestEventName = packageName + "/GenericTestEvent"
+	const genericTypeParameterEventName = packageName + ".GenericTestEvent"
+
+	cmp(t, typeOf[TestEvent](), testEventName)
+	cmp(t, typeOf[*TestEvent](), "*"+testEventName)
+	cmp(t, typeOf[**TestEvent](), "**"+testEventName)
+	cmp(t, typeOf[GenericTestEvent[string]](), genericTestEventName+"[string]")
+	cmp(t, typeOf[GenericTestEvent[GenericTestEvent[string]]](), genericTestEventName+"["+genericTypeParameterEventName+"[string]"+"]")
+	cmp(t, typeOf[GenericTestEvent[*GenericTestEvent[string]]](), genericTestEventName+"[*"+genericTypeParameterEventName+"[string]"+"]")
+	cmp(t, typeOf[GenericTestEvent[*GenericTestEvent[map[int][]float64]]](), genericTestEventName+"[*"+genericTypeParameterEventName+"[map[int][]float64]"+"]")
+
 }
 
 func TestDispatchEventStream(t *testing.T) {
