@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -95,7 +96,7 @@ type Dispatcher[T any] interface {
 // SyncEvent[T] is an event wrapper which contains the event T payload and a channel to
 // signal when the event is processed.
 type SyncEvent[T any] struct {
-	closed *atomicbool
+	closed atomic.Bool
 	done   chan struct{}
 
 	// Event contains the T event payload that was dispatched.
@@ -104,11 +105,11 @@ type SyncEvent[T any] struct {
 
 // Done notifies the event system that the event has been processed by the receiver.
 func (se *SyncEvent[T]) Done() {
-	if se.closed == nil {
+	if se == nil {
 		return
 	}
 
-	if !se.closed.CompareAndSet(false, true) {
+	if !se.closed.CompareAndSwap(false, true) {
 		return
 	}
 
@@ -120,9 +121,8 @@ func (se *SyncEvent[T]) Done() {
 // creates a new synchronous event wrapper to pass to the synchronous event stream.
 func newSyncEvent[T any](event T) SyncEvent[T] {
 	return SyncEvent[T]{
-		closed: newAtomicBool(false),
-		done:   make(chan struct{}),
-		Event:  event,
+		done:  make(chan struct{}),
+		Event: event,
 	}
 }
 
@@ -130,9 +130,8 @@ func newSyncEvent[T any](event T) SyncEvent[T] {
 // an event dispatched asynchronously
 func newFauxSyncEvent[T any](event T) SyncEvent[T] {
 	return SyncEvent[T]{
-		closed: newAtomicBool(false),
-		done:   nil,
-		Event:  event,
+		done:  nil,
+		Event: event,
 	}
 }
 
@@ -144,18 +143,15 @@ func newFauxSyncEvent[T any](event T) SyncEvent[T] {
 type asyncEventStream[T any] struct {
 	stream     chan T
 	syncStream chan SyncEvent[T]
-	closed     *atomicbool
-	accessed   *atomicbool
-	sync       *atomicbool
+	closed     atomic.Bool
+	accessed   atomic.Bool
+	sync       atomic.Bool
 	condition  EventCondition[T]
 }
 
 // newAsyncEventStream creates a new asynchronous event stream for a listener.
 func newAsyncEventStream[T any](condition EventCondition[T]) *asyncEventStream[T] {
 	return &asyncEventStream[T]{
-		accessed:   newAtomicBool(false),
-		sync:       newAtomicBool(false),
-		closed:     newAtomicBool(false),
 		stream:     make(chan T),
 		syncStream: make(chan SyncEvent[T]),
 		condition:  condition,
@@ -164,11 +160,11 @@ func newAsyncEventStream[T any](condition EventCondition[T]) *asyncEventStream[T
 
 // Stream returns access to the event T channel where events will arrive.
 func (aes *asyncEventStream[T]) Stream() <-chan T {
-	if aes.accessed.CompareAndSet(false, true) {
-		aes.sync.Set(false)
+	if aes.accessed.CompareAndSwap(false, true) {
+		aes.sync.Store(false)
 	}
 
-	if aes.sync.Get() {
+	if aes.sync.Load() {
 		// NOTE: Returning a nil channel here would be preferable, but golang will indefinitely block
 		// NOTE: when range looping over a nil channel:
 		// NOTE: https://groups.google.com/g/golang-nuts/c/QltQ0nd9HvE/m/4TR-Bw1xbX8J
@@ -181,11 +177,11 @@ func (aes *asyncEventStream[T]) Stream() <-chan T {
 // SyncStream returns a channel that receives SyncEvent[T] instances containing the event T
 // payload and a channel to signal when the event is processed.
 func (aes *asyncEventStream[T]) SyncStream() <-chan SyncEvent[T] {
-	if aes.accessed.CompareAndSet(false, true) {
-		aes.sync.Set(true)
+	if aes.accessed.CompareAndSwap(false, true) {
+		aes.sync.Store(true)
 	}
 
-	if !aes.sync.Get() {
+	if !aes.sync.Load() {
 		// NOTE: Returning a nil channel here would be preferable, but golang will indefinitely block
 		// NOTE: when range looping over a nil channel:
 		// NOTE: https://groups.google.com/g/golang-nuts/c/QltQ0nd9HvE/m/4TR-Bw1xbX8J
@@ -197,7 +193,7 @@ func (aes *asyncEventStream[T]) SyncStream() <-chan SyncEvent[T] {
 
 // Close shuts down the event stream, closing the channel
 func (aes *asyncEventStream[T]) Close() {
-	if !aes.closed.CompareAndSet(false, true) {
+	if !aes.closed.CompareAndSwap(false, true) {
 		return
 	}
 
@@ -207,7 +203,7 @@ func (aes *asyncEventStream[T]) Close() {
 
 // IsClosed is set to true if the event stream has been closed
 func (aes *asyncEventStream[T]) IsClosed() bool {
-	return aes.closed.Get()
+	return aes.closed.Load()
 }
 
 //--------------------------------------------------------------------------
@@ -523,10 +519,10 @@ func (md *multicastDispatcher[T]) executeAsync(streams []*asyncEventStream[T], e
 
 			// Ensure that the event stream has been accessed before sending an event. This
 			// prevents go routines from leaking on asynchronous dispatch.
-			if stream.accessed.Get() {
+			if stream.accessed.Load() {
 				// For synchronous receivers using an async dispatch, we still want to send
 				// an event, but we won't block the dispatching go routine.
-				if stream.sync.Get() {
+				if stream.sync.Load() {
 					syncEvent := newFauxSyncEvent(evt.event)
 					stream.syncStream <- syncEvent
 					// we do not wait for an async dispatch to a synchronous receiver
@@ -566,12 +562,12 @@ func (md *multicastDispatcher[T]) executeSync(streams []*asyncEventStream[T], ev
 			// Ensure that the event stream has been accessed before sending an event. This
 			// is to ensure that synchronous events do not wait for a receiver that doesn't
 			// exist, and prevents go routines from leaking.
-			if stream.accessed.Get() {
+			if stream.accessed.Load() {
 				// When an event stream has been accessed, we also know whether or not
 				// it is synchronous. This changes the behavior of the dispatch-sync
 				// to now wait for the receiver to notify us that it is done before
 				// continuing.
-				if stream.sync.Get() {
+				if stream.sync.Load() {
 					syncEvent := newSyncEvent(evt.event)
 					stream.syncStream <- syncEvent
 
