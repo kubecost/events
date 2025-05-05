@@ -96,7 +96,7 @@ type Dispatcher[T any] interface {
 // SyncEvent[T] is an event wrapper which contains the event T payload and a channel to
 // signal when the event is processed.
 type SyncEvent[T any] struct {
-	closed atomic.Bool
+	closed *atomic.Bool
 	done   chan struct{}
 
 	// Event contains the T event payload that was dispatched.
@@ -121,8 +121,9 @@ func (se *SyncEvent[T]) Done() {
 // creates a new synchronous event wrapper to pass to the synchronous event stream.
 func newSyncEvent[T any](event T) SyncEvent[T] {
 	return SyncEvent[T]{
-		done:  make(chan struct{}),
-		Event: event,
+		closed: new(atomic.Bool),
+		done:   make(chan struct{}),
+		Event:  event,
 	}
 }
 
@@ -130,8 +131,9 @@ func newSyncEvent[T any](event T) SyncEvent[T] {
 // an event dispatched asynchronously
 func newFauxSyncEvent[T any](event T) SyncEvent[T] {
 	return SyncEvent[T]{
-		done:  nil,
-		Event: event,
+		closed: new(atomic.Bool),
+		done:   nil,
+		Event:  event,
 	}
 }
 
@@ -472,15 +474,16 @@ func (md *multicastDispatcher[T]) getFilteredEventStreams(event T) []*asyncEvent
 		return nil
 	}
 
-	// ensure that we remove all streams that are closed
-	md.streams.RemoveOn(func(stream *asyncEventStream[T]) bool {
-		return stream == nil || stream.IsClosed()
-	})
-
-	// return a slice containing the streams to dispatch to
-	return md.streams.Filtered(func(stream *asyncEventStream[T]) bool {
-		return stream.condition == nil || stream.condition(event)
-	})
+	// ensure that we remove all streams that are closed,
+	// and filter out any streams that do not match the event conditions
+	return md.streams.RemoveAndFilter(
+		func(stream *asyncEventStream[T]) bool {
+			return stream == nil || stream.IsClosed()
+		},
+		func(stream *asyncEventStream[T]) bool {
+			return stream.condition == nil || stream.condition(event)
+		},
+	)
 }
 
 // getHandlerClose is a helper function which allows tests to access the onClose channel for
@@ -606,9 +609,9 @@ func (md *multicastDispatcher[T]) executeHandler(handler EventHandler[T], event 
 			if e, ok := r.(error); ok {
 				err = e
 			} else if s, ok := r.(string); ok {
-				err = fmt.Errorf("Unexpected panic: %s", s)
+				err = fmt.Errorf("unexpected panic: %s", s)
 			} else {
-				err = fmt.Errorf("Unexpected panic: %+v", r)
+				err = fmt.Errorf("unexpected panic: %+v", r)
 			}
 		}
 	}()
