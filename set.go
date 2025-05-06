@@ -28,6 +28,10 @@ type set[T comparable] interface {
 	// Filtered returns a slice of items that match the predicate.
 	Filtered(func(T) bool) []T
 
+	// RemoveAndFilter accepts two predicates, the first is used to remove items from the set,
+	// while the second is used to filter the items in the remaining set.
+	RemoveAndFilter(removeOn func(T) bool, filterOn func(T) bool) []T
+
 	// Length returns the total number of items in the set.
 	Length() int
 
@@ -116,6 +120,25 @@ func (s *lockingSet[T]) Length() int {
 	return len(s.m)
 }
 
+func (s *lockingSet[T]) RemoveAndFilter(removeOn func(T) bool, filterOn func(T) bool) []T {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	var slice []T
+	for k := range s.m {
+		if removeOn(k) {
+			delete(s.m, k)
+			continue
+		}
+
+		if filterOn(k) {
+			slice = append(slice, k)
+		}
+	}
+
+	return slice
+}
+
 // ToSlice creates a new slice of size Length(), copies the set elements into the slice, and
 // returns it.
 func (s *lockingSet[T]) ToSlice() []T {
@@ -166,7 +189,7 @@ func (s *lockingSet[T]) CopyTo(destination []T) error {
 	}
 
 	if len(destination) > l {
-		return fmt.Errorf("Destination length(%d) < source length (%d)", len(destination), l)
+		return fmt.Errorf("destination length(%d) < source length (%d)", len(destination), l)
 	}
 
 	index := 0

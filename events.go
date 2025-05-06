@@ -8,9 +8,8 @@ import (
 )
 
 var (
-	lock         sync.Mutex
-	dispatchers  map[string]any
-	dispatchers2 map[reflect.Type]any
+	lock        sync.Mutex
+	dispatchers map[string]any
 )
 
 func init() {

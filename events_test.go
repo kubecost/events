@@ -2,10 +2,14 @@ package events
 
 import (
 	"fmt"
+	"math/rand"
+	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"weak"
 )
 
 //--------------------------------------------------------------------------
@@ -258,6 +262,36 @@ func TestAddRemoveHandlersMidStreamSync(t *testing.T) {
 	if eventStreams != 0 {
 		t.Errorf("Event Streams were not empty. Got: %d\n", eventStreams)
 	}
+}
+
+func TestPanicOnListener(t *testing.T) {
+	type Panic struct {
+		Message string
+	}
+
+	d := NewDispatcher[TestEvent]()
+
+	d.AddEventHandler(func(event TestEvent) {
+		t.Logf("Handler One: [Event: %s]\n", event.Message)
+		panic("Panic on listener")
+	})
+
+	d.AddEventHandler(func(event TestEvent) {
+		t.Logf("Handler Two: [Event: %s]\n", event.Message)
+		panic(fmt.Errorf("Panic error!"))
+	})
+
+	d.AddEventHandler(func(event TestEvent) {
+		t.Logf("Handler Three: [Event: %s]\n", event.Message)
+		panic(Panic{"Panic struct"})
+	})
+
+	time.Sleep(100 * time.Millisecond)
+
+	d.Dispatch(TestEvent{"Test"})
+
+	time.Sleep(500 * time.Millisecond)
+	d.CloseEventStreams()
 }
 
 func TestFilteredEventStreams(t *testing.T) {
@@ -635,7 +669,7 @@ func TestBlockingSyncDispatch(t *testing.T) {
 	case <-time.After(3 * time.Second):
 	}
 
-	delta := time.Now().Sub(start)
+	delta := time.Since(start)
 	if delta < (2 * time.Second) {
 		t.Errorf("Test failed. Blocked for less than 2 seconds: %dms\n", delta.Milliseconds())
 	}
@@ -651,6 +685,218 @@ func TestBlockingSyncDispatch(t *testing.T) {
 		t.Errorf("Test failed. Timed out after 1 second\n")
 	}
 
+}
+
+func TestBlockingSyncMultiDispatch(t *testing.T) {
+	const listeners = 30
+
+	var waitTimeLock sync.Mutex
+	waitTimes := []time.Duration{}
+
+	d := NewDispatcher[TestEvent]()
+	defer d.CloseEventStreams()
+
+	var wg sync.WaitGroup
+	wg.Add(listeners)
+
+	// Create multiple stream listeners
+	for i := range listeners {
+		go func(id int) {
+			es := d.NewEventStream()
+			ss := es.SyncStream()
+
+			// notify waitgroup that the go routine has started
+			wg.Done()
+
+			for syncEvent := range ss {
+				func() {
+					defer syncEvent.Done()
+
+					// simulate some work
+					dur := time.Duration(100+rand.Intn(1500)) * time.Millisecond
+
+					waitTimeLock.Lock()
+					waitTimes = append(waitTimes, dur)
+					waitTimeLock.Unlock()
+
+					time.Sleep(dur)
+
+					t.Logf("[%d] Handled: %s\n", id, syncEvent.Event.Message)
+				}()
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	time.Sleep(200 * time.Millisecond)
+
+	// dispatch single event, should block until all listeners are done
+	now := time.Now().UTC()
+	d.DispatchSyncWithTimeout(TestEvent{Message: "TestEvent"}, 5*time.Second)
+	totalDuration := time.Since(now)
+
+	// we expect ALL handlers be done, so access to waiTimes _should_ be safe. If it's not, we
+	// have a bug :)
+	maxWaitTime := slices.Max(waitTimes)
+
+	t.Logf("Max Wait Time: %dms, Total Block Duration: %dms\n", maxWaitTime.Milliseconds(), totalDuration.Milliseconds())
+
+	if totalDuration < maxWaitTime {
+		t.Errorf("DispatchSync returned before all handlers were done. Total: %dms, Max Wait: %dms\n", totalDuration.Milliseconds(), maxWaitTime.Milliseconds())
+	}
+}
+
+func TestMultiEventBlockingSyncMultiDispatch(t *testing.T) {
+	const listeners = 30
+	const dispatches = 10
+
+	var countLock sync.Mutex
+	counts := make(map[int]*atomic.Uint64)
+
+	var waitTimeLock sync.Mutex
+	waitTimes := []time.Duration{}
+
+	d := NewDispatcher[TestEvent]()
+	defer d.CloseEventStreams()
+
+	var wg sync.WaitGroup
+	wg.Add(listeners)
+
+	// Create multiple stream listeners
+	for i := range listeners {
+		go func(id int) {
+			es := d.NewEventStream()
+			ss := es.SyncStream()
+
+			// notify waitgroup that the go routine has started
+			wg.Done()
+
+			for syncEvent := range ss {
+				func() {
+					defer syncEvent.Done()
+
+					// simulate some work
+					dur := time.Duration(200+rand.Intn(300)) * time.Millisecond
+
+					waitTimeLock.Lock()
+					waitTimes = append(waitTimes, dur)
+					waitTimeLock.Unlock()
+
+					countLock.Lock()
+					if _, ok := counts[id]; !ok {
+						counts[id] = new(atomic.Uint64)
+					}
+					counts[id].Add(1)
+					countLock.Unlock()
+
+					time.Sleep(dur)
+
+					t.Logf("[%d] Handled: %s\n", id, syncEvent.Event.Message)
+				}()
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	time.Sleep(200 * time.Millisecond)
+
+	for i := range dispatches {
+		now := time.Now().UTC()
+		d.DispatchSync(TestEvent{Message: fmt.Sprintf("TestEvent: %d", i)})
+		totalDuration := time.Since(now)
+
+		maxWaitTime := slices.Max(waitTimes)
+		t.Logf("Max Wait Time: %dms, Total Block Duration: %dms\n", maxWaitTime.Milliseconds(), totalDuration.Milliseconds())
+		if totalDuration < maxWaitTime {
+			t.Errorf("DispatchSync returned before all handlers were done. Total: %dms, Max Wait: %dms\n", totalDuration.Milliseconds(), maxWaitTime.Milliseconds())
+		}
+
+		waitTimes = waitTimes[:0]
+	}
+
+	for k, v := range counts {
+		count := v.Load()
+		t.Logf("Listener: %d, Count: %d", k, count)
+
+		if count != dispatches {
+			t.Errorf("Listener: %d, Count != %d. Got: %d\n", k, dispatches, count)
+		}
+	}
+}
+
+func TestMultiEventBlockingAsyncMultiDispatch(t *testing.T) {
+	const listeners = 30
+	const dispatches = 10
+
+	type TEvent struct {
+		ID      int
+		Message string
+	}
+
+	var countLock sync.Mutex
+	counts := make(map[int]*atomic.Uint64)
+
+	d := NewDispatcher[TEvent]()
+	defer d.CloseEventStreams()
+
+	var wg sync.WaitGroup
+	wg.Add(listeners)
+
+	// Create multiple stream listeners
+	for i := range listeners {
+		go func(id int) {
+			es := d.NewEventStream()
+			ss := es.SyncStream()
+
+			// notify waitgroup that the go routine has started
+			wg.Done()
+
+			for syncEvent := range ss {
+				func() {
+					defer syncEvent.Done()
+
+					// simulate some work
+					dur := time.Duration(200+rand.Intn(300)) * time.Millisecond
+
+					countLock.Lock()
+					if _, ok := counts[id]; !ok {
+						counts[id] = new(atomic.Uint64)
+					}
+					counts[id].Add(1)
+					countLock.Unlock()
+
+					time.Sleep(dur)
+
+					//t.Logf("[%d] Handled: %s\n", id, syncEvent.Event.Message)
+				}()
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	time.Sleep(200 * time.Millisecond)
+
+	var allDispatches sync.WaitGroup
+	allDispatches.Add(dispatches)
+
+	for i := range dispatches {
+		go func(id int) {
+			defer allDispatches.Done()
+
+			d.DispatchSync(TEvent{ID: id, Message: fmt.Sprintf("TestEvent: %d", id)})
+		}(i)
+	}
+
+	allDispatches.Wait()
+
+	for k, v := range counts {
+		count := v.Load()
+		t.Logf("Listener: %d, Count: %d", k, count)
+
+		if count != dispatches {
+			t.Errorf("Listener: %d, Count != %d. Got: %d\n", k, dispatches, count)
+		}
+	}
 }
 
 func TestStreamAccessSwitching(t *testing.T) {
@@ -694,6 +940,104 @@ func TestStreamAccessSwitching(t *testing.T) {
 	case <-waitChannelFor(&wg):
 	case <-time.After(1 * time.Second):
 		t.Errorf("Failed to exit sync stream in time!")
+	}
+}
+
+func TestEventsWithoutListeners(t *testing.T) {
+	// this test just ensures that we can dispatch events without listeners and
+	// they fall into the void.
+	type TEvent struct {
+		ID      int
+		Message string
+	}
+	weakEvents := []weak.Pointer[TEvent]{}
+
+	d := NewDispatcher[*TEvent]()
+
+	// signal to dispatcher to start listening
+	startListener := make(chan struct{})
+	resumeEvents := make(chan struct{})
+
+	go func() {
+		<-startListener
+
+		d.AddEventHandler(func(te *TEvent) {
+			t.Logf("Received: %s\n", te.Message)
+		})
+		close(resumeEvents)
+	}()
+
+	for i := 0; i < 50; i++ {
+		if i == 30 {
+			close(startListener)
+			<-resumeEvents
+		}
+
+		testEvent := &TEvent{
+			ID:      i,
+			Message: fmt.Sprintf("Test:%d", i),
+		}
+
+		// add a weak ptr to the event
+		weakEvents = append(weakEvents, weak.Make(testEvent))
+
+		// dispatch the event
+		d.Dispatch(testEvent)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	runtime.GC()
+	time.Sleep(time.Second)
+
+	for _, weakEvent := range weakEvents {
+		val := weakEvent.Value()
+		if val != nil {
+			// check that only events with ID < 30 are dead
+			if val.ID < 30 {
+				t.Errorf("Weak event was not garbage collected: %s\n", weakEvent.Value().Message)
+			}
+		}
+	}
+
+}
+
+func TestPointerEvent(t *testing.T) {
+	const listeners = 20
+
+	type TEvent struct {
+		ID      int
+		Message string
+		Count   atomic.Uint64
+	}
+
+	d := NewDispatcher[*TEvent]()
+	defer d.CloseEventStreams()
+
+	var wg sync.WaitGroup
+	wg.Add(listeners)
+
+	listener := func(te *TEvent) {
+		defer wg.Done()
+
+		t.Logf("Received: %s\n", te.Message)
+		te.Count.Add(1)
+	}
+
+	for range listeners {
+		d.AddEventHandler(listener)
+	}
+
+	testEvent := &TEvent{
+		ID:      1,
+		Message: "Test",
+	}
+
+	d.Dispatch(testEvent)
+
+	wg.Wait()
+
+	if testEvent.Count.Load() != uint64(listeners) {
+		t.Errorf("Count != %d. Got: %d\n", listeners, testEvent.Count.Load())
 	}
 }
 
