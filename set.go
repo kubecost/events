@@ -1,75 +1,74 @@
 package events
 
 import (
-	"fmt"
 	"sync"
+	"weak"
 )
 
 // set is an implementation prototype for a basic mathematical set data structure. It's API is geared more
 // towards a specific use inside the events package rather than a more general purpose use.
-type set[T comparable] interface {
+type set[T any] interface {
 	// Adds an item to the set. If the item already exists, it is replaced.
-	Add(item T)
+	Add(item *T)
 
 	// Remove removes the item from the set if it exists, which returns true. If the item doesn't
 	// exist, false is returned.
-	Remove(item T) bool
+	Remove(item *T) bool
 
 	// RemoveOn accepts a predicate that is run against each item, removing the item on a true
 	// return.
-	RemoveOn(func(T) bool)
+	RemoveOn(func(*T) bool)
 
 	// RemoveAll removes all of the items in the set
 	RemoveAll()
 
 	// Has returns true if the item exists within the set. Otherwise, false.
-	Has(item T) bool
+	Has(item *T) bool
 
 	// Filtered returns a slice of items that match the predicate.
-	Filtered(func(T) bool) []T
+	Filtered(func(*T) bool) []*T
 
 	// RemoveAndFilter accepts two predicates, the first is used to remove items from the set,
 	// while the second is used to filter the items in the remaining set.
-	RemoveAndFilter(removeOn func(T) bool, filterOn func(T) bool) []T
+	RemoveAndFilter(removeOn func(*T) bool, filterOn func(*T) bool) []*T
 
 	// Length returns the total number of items in the set.
 	Length() int
 
 	// ToSlice creates a new slice of size Length(), copies the set elements into the slice, and
 	// returns it.
-	ToSlice() []T
-
-	// CopyTo accepts a destination slice and writes the contents of the set to it.
-	CopyTo([]T) error
+	ToSlice() []*T
 }
 
 // lockingSet is a thread-safe implementation of set which leverages a go map for storage.
-type lockingSet[T comparable] struct {
+type lockingSet[T any] struct {
 	lock sync.Mutex
-	m    map[T]struct{}
+	m    map[weak.Pointer[T]]struct{}
 }
 
 // creates a new set for use with dispatching
-func newSet[T comparable]() set[T] {
+func newSet[T any]() set[T] {
 	return &lockingSet[T]{
-		m: make(map[T]struct{}),
+		m: make(map[weak.Pointer[T]]struct{}),
 	}
 }
 
 // Adds an item to the set. If the item already exists, it is replaced.
-func (s *lockingSet[T]) Add(item T) {
+func (s *lockingSet[T]) Add(v *T) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
+	item := weak.Make(v)
 	s.m[item] = struct{}{}
 }
 
 // Remove removes the item from the set if it exists, which returns true. If the item doesn't
 // exist, false is returned.
-func (s *lockingSet[T]) Remove(item T) (ok bool) {
+func (s *lockingSet[T]) Remove(v *T) (ok bool) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
+	item := weak.Make(v)
 	_, ok = s.m[item]
 
 	if !ok {
@@ -82,12 +81,18 @@ func (s *lockingSet[T]) Remove(item T) (ok bool) {
 
 // RemoveOn accepts a predicate that is run against each item, removing the item on a true
 // return.
-func (s *lockingSet[T]) RemoveOn(predicate func(T) bool) {
+func (s *lockingSet[T]) RemoveOn(predicate func(*T) bool) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
 	for k := range s.m {
-		if predicate(k) {
+		v := k.Value()
+		if v == nil {
+			delete(s.m, k)
+			continue
+		}
+
+		if predicate(v) {
 			delete(s.m, k)
 		}
 	}
@@ -104,10 +109,11 @@ func (s *lockingSet[T]) RemoveAll() {
 }
 
 // Has returns true if the item exists within the set. Otherwise, false.
-func (s *lockingSet[T]) Has(item T) bool {
+func (s *lockingSet[T]) Has(v *T) bool {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
+	item := weak.Make(v)
 	_, ok := s.m[item]
 	return ok
 }
@@ -120,19 +126,24 @@ func (s *lockingSet[T]) Length() int {
 	return len(s.m)
 }
 
-func (s *lockingSet[T]) RemoveAndFilter(removeOn func(T) bool, filterOn func(T) bool) []T {
+func (s *lockingSet[T]) RemoveAndFilter(removeOn func(*T) bool, filterOn func(*T) bool) []*T {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
-	var slice []T
+	var slice []*T
 	for k := range s.m {
-		if removeOn(k) {
+		v := k.Value()
+		if v == nil {
+			delete(s.m, k)
+			continue
+		}
+		if removeOn(v) {
 			delete(s.m, k)
 			continue
 		}
 
-		if filterOn(k) {
-			slice = append(slice, k)
+		if filterOn(v) {
+			slice = append(slice, v)
 		}
 	}
 
@@ -141,7 +152,7 @@ func (s *lockingSet[T]) RemoveAndFilter(removeOn func(T) bool, filterOn func(T) 
 
 // ToSlice creates a new slice of size Length(), copies the set elements into the slice, and
 // returns it.
-func (s *lockingSet[T]) ToSlice() []T {
+func (s *lockingSet[T]) ToSlice() []*T {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
@@ -150,17 +161,21 @@ func (s *lockingSet[T]) ToSlice() []T {
 		return nil
 	}
 
-	slice := make([]T, l)
-	index := 0
+	slice := make([]*T, 0, l)
 	for k := range s.m {
-		slice[index] = k
-		index++
+		v := k.Value()
+		if v == nil {
+			delete(s.m, k)
+			continue
+		}
+		slice = append(slice, v)
 	}
+
 	return slice
 }
 
 // Filtered returns a slice of items that match the predicate.
-func (s *lockingSet[T]) Filtered(predicate func(T) bool) []T {
+func (s *lockingSet[T]) Filtered(predicate func(*T) bool) []*T {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
@@ -169,33 +184,17 @@ func (s *lockingSet[T]) Filtered(predicate func(T) bool) []T {
 		return nil
 	}
 
-	var slice []T
+	var slice []*T
 	for k := range s.m {
-		if predicate(k) {
-			slice = append(slice, k)
+		v := k.Value()
+		if v == nil {
+			delete(s.m, k)
+			continue
+		}
+
+		if predicate(v) {
+			slice = append(slice, v)
 		}
 	}
 	return slice
-}
-
-// CopyTo accepts a destination slice and writes the contents of the set to it.
-func (s *lockingSet[T]) CopyTo(destination []T) error {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
-	l := len(s.m)
-	if l == 0 {
-		return nil
-	}
-
-	if len(destination) > l {
-		return fmt.Errorf("destination length(%d) < source length (%d)", len(destination), l)
-	}
-
-	index := 0
-	for k := range s.m {
-		destination[index] = k
-		index++
-	}
-	return nil
 }

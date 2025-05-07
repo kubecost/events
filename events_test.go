@@ -99,6 +99,7 @@ func TestTypeOf(t *testing.T) {
 }
 
 func TestDispatchEventStream(t *testing.T) {
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -165,6 +166,40 @@ func TestSingleDispatcherMultipleHandlers(t *testing.T) {
 		t.Errorf("Test failed. Timed out after 5 seconds\n")
 	case <-waitChannelFor(&wg):
 		t.Logf("Completed successfully\n")
+	}
+}
+
+func TestZombieStreams(t *testing.T) {
+	d := NewDispatcher[TestEvent]()
+	mcd := d.(*multicastDispatcher[TestEvent])
+
+	// this test ensures that the way we addressed zombie event streams works as expected.
+	// we are now managing weak pointers to event streams internally, and if the stream is GC'd,
+	// it no longer clogs up the dispatch queue. This was a somewhat rare occurence, but could
+	// happen if the stream was created and not used
+	es := d.NewEventStream()
+
+	beforeLength := mcd.streams.Length()
+	if beforeLength != 1 {
+		t.Errorf("Event stream length != 1. Got: %d\n", beforeLength)
+	}
+
+	// nil out the event stream, and run garbage collection
+	_ = es
+	es = nil
+	runtime.GC()
+
+	// wait a a bit to ensure we're not racing with the GC
+	time.Sleep(500 * time.Millisecond)
+
+	// dispatch sync to flush the stream (weak pointer should be nil at this point)
+	d.DispatchSync(TestEvent{"Test"})
+
+	// re-check the stream length
+	afterLength := mcd.streams.Length()
+
+	if afterLength != 0 {
+		t.Errorf("Zombie streams were not cleaned up. Got: %d\n", afterLength)
 	}
 }
 
