@@ -3,6 +3,7 @@ package events
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -245,7 +246,7 @@ type multicastDispatcher[T any] struct {
 	handlers    map[HandlerID]*eventStreamHandler[T]
 	handlerLock sync.Mutex
 
-	streams set[*asyncEventStream[T]]
+	streams set[asyncEventStream[T]]
 }
 
 // AddEventHandler adds a new event handler method that is called whenever an event T is
@@ -378,6 +379,14 @@ func (md *multicastDispatcher[T]) NewEventStream() EventStream[T] {
 // match the provided condition.
 func (md *multicastDispatcher[T]) NewFilteredEventStream(condition EventCondition[T]) EventStream[T] {
 	aes := newAsyncEventStream(condition)
+
+	// close the stream when the event stream is GC'd
+	runtime.SetFinalizer(aes, func(aes *asyncEventStream[T]) {
+		if aes != nil {
+			aes.Close()
+		}
+	})
+
 	md.streams.Add(aes)
 	return aes
 }
@@ -399,7 +408,7 @@ func newMulticastDispatcher[T any](persistent bool) Dispatcher[T] {
 	md := &multicastDispatcher[T]{
 		in:       in,
 		end:      end,
-		streams:  newSet[*asyncEventStream[T]](),
+		streams:  newSet[asyncEventStream[T]](),
 		handlers: make(map[HandlerID]*eventStreamHandler[T]),
 	}
 
