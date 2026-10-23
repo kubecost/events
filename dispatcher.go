@@ -142,22 +142,32 @@ func newFauxSyncEvent[T any](event T) SyncEvent[T] {
 //  Default EventStream[T] Implementation
 //--------------------------------------------------------------------------
 
-// asyncEventStream contains the event stream channel and metadata
-type asyncEventStream[T any] struct {
+// eventStreamState contains the event stream channels and metadata. It must never reference
+// the asyncEventStream which owns it, so the owner can be reclaimed (closing the state) even
+// when the owner is part of a reference cycle, ie: a condition which captures its own stream.
+type eventStreamState[T any] struct {
 	stream     chan T
 	syncStream chan SyncEvent[T]
 	closed     atomic.Bool
 	accessed   atomic.Bool
 	sync       atomic.Bool
-	condition  EventCondition[T]
+}
+
+// asyncEventStream is the EventStream[T] handle provided to listeners. The dispatcher only
+// holds a weak pointer to the handle, so its lifetime is controlled by the listener.
+type asyncEventStream[T any] struct {
+	*eventStreamState[T]
+	condition EventCondition[T]
 }
 
 // newAsyncEventStream creates a new asynchronous event stream for a listener.
 func newAsyncEventStream[T any](condition EventCondition[T]) *asyncEventStream[T] {
 	return &asyncEventStream[T]{
-		stream:     make(chan T),
-		syncStream: make(chan SyncEvent[T]),
-		condition:  condition,
+		eventStreamState: &eventStreamState[T]{
+			stream:     make(chan T),
+			syncStream: make(chan SyncEvent[T]),
+		},
+		condition: condition,
 	}
 }
 
@@ -195,18 +205,18 @@ func (aes *asyncEventStream[T]) SyncStream() <-chan SyncEvent[T] {
 }
 
 // Close shuts down the event stream, closing the channel
-func (aes *asyncEventStream[T]) Close() {
-	if !aes.closed.CompareAndSwap(false, true) {
+func (ess *eventStreamState[T]) Close() {
+	if !ess.closed.CompareAndSwap(false, true) {
 		return
 	}
 
-	close(aes.stream)
-	close(aes.syncStream)
+	close(ess.stream)
+	close(ess.syncStream)
 }
 
 // IsClosed is set to true if the event stream has been closed
-func (aes *asyncEventStream[T]) IsClosed() bool {
-	return aes.closed.Load()
+func (ess *eventStreamState[T]) IsClosed() bool {
+	return ess.closed.Load()
 }
 
 //--------------------------------------------------------------------------
@@ -263,16 +273,24 @@ func (md *multicastDispatcher[T]) AddFilteredEventHandler(handler EventHandler[T
 	stream := md.NewFilteredEventStream(condition)
 	onClose := make(chan struct{})
 
-	ch := make(chan struct{})
+	// the dispatcher skips streams which have not been accessed, so access the stream before
+	// returning to ensure any event dispatched after this call is received by the handler
+	events := stream.Stream()
+	sHandler := &eventStreamHandler[T]{
+		id:      handlerID,
+		stream:  stream,
+		onClose: onClose,
+	}
+
+	md.handlerLock.Lock()
+	md.handlers[handlerID] = sHandler
+	md.handlerLock.Unlock()
 
 	// create a new go routine event receive loop for the new event stream
 	go func(id HandlerID) {
 		defer close(onClose)
 
-		// notify the handler goroutine was added
-		ch <- struct{}{}
-
-		for event := range stream.Stream() {
+		for event := range events {
 			err := md.executeHandler(handler, event)
 
 			// TODO: Pipe any errors that occur to an external handler rather than TODO:
@@ -289,18 +307,6 @@ func (md *multicastDispatcher[T]) AddFilteredEventHandler(handler EventHandler[T
 		delete(md.handlers, id)
 		md.handlerLock.Unlock()
 	}(handlerID)
-
-	<-ch
-
-	sHandler := &eventStreamHandler[T]{
-		id:      handlerID,
-		stream:  stream,
-		onClose: onClose,
-	}
-
-	md.handlerLock.Lock()
-	md.handlers[handlerID] = sHandler
-	md.handlerLock.Unlock()
 
 	return handlerID
 }
@@ -380,12 +386,9 @@ func (md *multicastDispatcher[T]) NewEventStream() EventStream[T] {
 func (md *multicastDispatcher[T]) NewFilteredEventStream(condition EventCondition[T]) EventStream[T] {
 	aes := newAsyncEventStream(condition)
 
-	// close the stream when the event stream is GC'd
-	runtime.SetFinalizer(aes, func(aes *asyncEventStream[T]) {
-		if aes != nil {
-			aes.Close()
-		}
-	})
+	// close the stream state when the event stream is GC'd. unlike a finalizer, a cleanup
+	// still runs if the event stream is part of a reference cycle.
+	runtime.AddCleanup(aes, (*eventStreamState[T]).Close, aes.eventStreamState)
 
 	md.streams.Add(aes)
 	return aes
@@ -512,7 +515,8 @@ func (md *multicastDispatcher[T]) getHandlerClose(id HandlerID) chan struct{} {
 // when a receiver doesn't exist.
 func (md *multicastDispatcher[T]) executeAsync(streams []*asyncEventStream[T], evt *dispatchedEvent[T]) {
 	for i := 0; i < len(streams); i++ {
-		go func(stream *asyncEventStream[T]) {
+		// pass only the stream state, so a blocked send never keeps the event stream alive
+		go func(stream *eventStreamState[T]) {
 			defer func() {
 				if r := recover(); r != nil {
 					// This will happen if events for the stream are queued and the stream
@@ -542,7 +546,7 @@ func (md *multicastDispatcher[T]) executeAsync(streams []*asyncEventStream[T], e
 					stream.stream <- evt.event
 				}
 			}
-		}(streams[i])
+		}(streams[i].eventStreamState)
 	}
 }
 
@@ -555,7 +559,8 @@ func (md *multicastDispatcher[T]) executeSync(streams []*asyncEventStream[T], ev
 	wg.Add(length)
 
 	for i := 0; i < length; i++ {
-		go func(stream *asyncEventStream[T]) {
+		// pass only the stream state, so a blocked send never keeps the event stream alive
+		go func(stream *eventStreamState[T]) {
 			defer func() {
 				if r := recover(); r != nil {
 					// This will happen if events for the stream are queued and the stream
@@ -601,7 +606,7 @@ func (md *multicastDispatcher[T]) executeSync(streams []*asyncEventStream[T], ev
 					stream.stream <- evt.event
 				}
 			}
-		}(streams[i])
+		}(streams[i].eventStreamState)
 	}
 
 	wg.Wait()

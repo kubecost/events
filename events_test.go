@@ -110,6 +110,7 @@ func TestDispatchEventStream(t *testing.T) {
 
 	go func() {
 		stream := d.NewEventStream()
+		defer stream.Close()
 
 		for event := range stream.Stream() {
 			t.Logf("Event: %s\n", event.Message)
@@ -203,6 +204,45 @@ func TestZombieStreams(t *testing.T) {
 	}
 }
 
+func TestSelfReferentialFilteredStreamCollected(t *testing.T) {
+	d := NewDispatcher[TestEvent]()
+	defer d.CloseEventStreams()
+	mcd := d.(*multicastDispatcher[TestEvent])
+
+	// a filter which captures its own stream creates a reference cycle through the stream.
+	// the stream is accessed, then abandoned without Close(), so it must be reclaimed by
+	// the GC. holding the channel does not keep the stream itself alive.
+	var ch <-chan TestEvent
+	func() {
+		var es EventStream[TestEvent]
+		es = d.NewFilteredEventStream(func(TestEvent) bool {
+			return es != nil
+		})
+		ch = es.Stream()
+	}()
+
+	// with no events dispatched, a receive only succeeds once the stream is closed
+	timeout := time.After(5 * time.Second)
+	for reclaimed := false; !reclaimed; {
+		runtime.GC()
+		select {
+		case <-ch:
+			reclaimed = true
+		case <-timeout:
+			t.Fatalf("Self-referential stream was never reclaimed")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// dispatch sync to flush the collected stream from the dispatcher. had the stream not
+	// been reclaimed, this would block forever on the abandoned receiver.
+	d.DispatchSync(TestEvent{"Flush"})
+
+	if length := mcd.streams.Length(); length != 0 {
+		t.Errorf("Self-referential stream was not cleaned up. Got: %d", length)
+	}
+}
+
 func TestAddRemoveHandlersMidStream(t *testing.T) {
 	const totalEvents = 10
 
@@ -253,6 +293,8 @@ func TestAddRemoveHandlersMidStreamSync(t *testing.T) {
 
 	// Synchronous Events require a receiver, so we create a single always running receiver
 	s := d.NewEventStream()
+	defer s.Close()
+
 	go func() {
 		for event := range s.Stream() {
 			t.Logf("Universal Handler: [Event %s]\n", event.Message)
@@ -296,6 +338,87 @@ func TestAddRemoveHandlersMidStreamSync(t *testing.T) {
 	eventStreams := len(d.(*multicastDispatcher[TestEvent]).getEventStreams())
 	if eventStreams != 0 {
 		t.Errorf("Event Streams were not empty. Got: %d\n", eventStreams)
+	}
+}
+
+func TestEventHandlerReceivesImmediateDispatch(t *testing.T) {
+	const runs = 10000
+
+	d := NewDispatcher[int]()
+	defer d.CloseEventStreams()
+	mcd := d.(*multicastDispatcher[int])
+
+	received := make(chan int, 1)
+	for i := 0; i < runs; i++ {
+		id := d.AddEventHandler(func(event int) {
+			received <- event
+		})
+
+		// the dispatcher skips streams which have not been accessed, so the handler's stream
+		// must be accessed before AddEventHandler returns
+		mcd.handlerLock.Lock()
+		aes := mcd.handlers[id].stream.(*asyncEventStream[int])
+		mcd.handlerLock.Unlock()
+
+		if !aes.accessed.Load() {
+			t.Fatalf("Handler stream was not accessed when AddEventHandler returned. Run: %d", i)
+		}
+
+		d.Dispatch(i)
+
+		select {
+		case event := <-received:
+			cmp(t, event, i)
+		case <-time.After(time.Second):
+			t.Fatalf("Handler did not receive event dispatched after it was added. Run: %d", i)
+		}
+
+		d.RemoveEventHandler(id)
+	}
+}
+
+func TestAddEventHandlerDuringCloseEventStreams(t *testing.T) {
+	const runs = 2000
+
+	// persistent dispatchers allow handlers to be added after closing event streams
+	d := newMulticastDispatcher[TestEvent](true)
+	defer d.CloseEventStreams()
+	mcd := d.(*multicastDispatcher[TestEvent])
+
+	for i := 0; i < runs; i++ {
+		done := make(chan struct{})
+		go func() {
+			d.CloseEventStreams()
+			close(done)
+		}()
+
+		id := d.AddEventHandler(func(TestEvent) {})
+		<-done
+
+		mcd.handlerLock.Lock()
+		handler, ok := mcd.handlers[id]
+		mcd.handlerLock.Unlock()
+
+		if !ok {
+			continue
+		}
+
+		// handler was added after the close, so it remains active
+		if !handler.stream.IsClosed() {
+			d.RemoveEventHandler(id)
+			continue
+		}
+
+		// handler stream was closed, so the handler must be removed once its goroutine exits
+		select {
+		case <-handler.onClose:
+		case <-time.After(time.Second):
+			t.Fatalf("Handler goroutine did not exit after its stream was closed. Run: %d", i)
+		}
+
+		if mcd.getHandlerClose(id) != nil {
+			t.Fatalf("Handler with a closed stream was not removed. Run: %d", i)
+		}
 	}
 }
 
@@ -406,6 +529,8 @@ func TestFilteredEventStreams(t *testing.T) {
 		defer goFuncGroup.Done()
 
 		stream := d.NewEventStream()
+		defer stream.Close()
+
 		wg.Done()
 
 		for syncEvent := range stream.SyncStream() {
@@ -529,6 +654,8 @@ func TestGlobalDispatcherCloseAllAndReuse(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		s := d.NewEventStream()
+		defer s.Close()
+
 		go func(ii int, stream EventStream[TestEvent]) {
 			handlerGroup.Done()
 
@@ -586,6 +713,8 @@ func TestSyncAndAsyncDispatch(t *testing.T) {
 		wait.Done()
 
 		stream := d.NewEventStream()
+		defer stream.Close()
+
 		for syncEvent := range stream.SyncStream() {
 			func() {
 				defer syncEvent.Done()
@@ -599,6 +728,8 @@ func TestSyncAndAsyncDispatch(t *testing.T) {
 		wait.Done()
 
 		stream := d.NewEventStream()
+		defer stream.Close()
+
 		for evt := range stream.Stream() {
 			atomic.AddUint32(&totalHandled, 1)
 			t.Logf("Async Receive: [%s]\n", evt.Message)
@@ -631,6 +762,8 @@ func TestDispatchSyncWithTimeout(t *testing.T) {
 		defer complete.Done()
 
 		es := d.NewEventStream()
+		defer es.Close()
+
 		for syncEvent := range es.SyncStream() {
 			t.Logf("I messed up and forgot to call Done() on the sync event: %s!\n", syncEvent.Event.Message)
 		}
@@ -678,6 +811,8 @@ func TestBlockingSyncDispatch(t *testing.T) {
 		defer complete.Done()
 
 		es := d.NewEventStream()
+		defer es.Close()
+
 		for syncEvent := range es.SyncStream() {
 			func() {
 				defer syncEvent.Done()
@@ -738,6 +873,8 @@ func TestBlockingSyncMultiDispatch(t *testing.T) {
 	for i := range listeners {
 		go func(id int) {
 			es := d.NewEventStream()
+			defer es.Close()
+
 			ss := es.SyncStream()
 
 			// notify waitgroup that the go routine has started
@@ -801,6 +938,8 @@ func TestMultiEventBlockingSyncMultiDispatch(t *testing.T) {
 	for i := range listeners {
 		go func(id int) {
 			es := d.NewEventStream()
+			defer es.Close()
+
 			ss := es.SyncStream()
 
 			// notify waitgroup that the go routine has started
@@ -881,6 +1020,8 @@ func TestMultiEventBlockingAsyncMultiDispatch(t *testing.T) {
 	for i := range listeners {
 		go func(id int) {
 			es := d.NewEventStream()
+			defer es.Close()
+
 			ss := es.SyncStream()
 
 			// notify waitgroup that the go routine has started
@@ -942,6 +1083,8 @@ func TestStreamAccessSwitching(t *testing.T) {
 
 	// we requested an event stream and accessed the async stream
 	es := d.NewEventStream()
+	defer es.Close()
+
 	stream := es.Stream()
 
 	go func() {

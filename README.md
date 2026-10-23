@@ -59,6 +59,9 @@ stream := dispatcher.NewEventStream()
 
 // typically, a stream will be handled in a separate goroutine
 go func() {
+    // closes the stream when the goroutine exits, and keeps the stream alive while receiving
+    defer stream.Close()
+
     for event := range stream.Stream() {
         fmt.Println(event.Message)
     }
@@ -71,6 +74,8 @@ dispatcher.Dispatch(MyEvent{Message: "Hello World!"})
 // Hello World!
 ```
 
+*NOTE* The dispatcher only holds a weak reference to an event stream, so a stream that is no longer referenced is garbage collected and closed. A range loop over `stream.Stream()` only references the channel, not the stream, so the stream can be collected while the loop is still receiving, which silently ends the loop. Calling `defer stream.Close()` in the receiving goroutine keeps the stream referenced for the lifetime of the loop, and unsubscribes the stream when the goroutine exits.
+
 ### Synchronous Dispatch and Receiving
 While the internals of the dispatching remain asynchronous, the API allows for event dispatchers to block until events are "received." This behavior depends on both the dispatcher and the event handler. If I add an event stream handler like in the previous example:
 
@@ -80,6 +85,7 @@ dispatcher := events.NewDispatcher[MyEvent]()
 // typically, a stream will be handled in a separate goroutine
 go func() {
     stream := dispatcher.NewEventStream()
+    defer stream.Close()
 
     for event := range stream.Stream() {
         fmt.Println(event.Message)
@@ -91,9 +97,9 @@ Then, this receiver will _always_ receive and handle events asynchronously. If y
 
 ```go
 go func() {
-    // This line is the same
+    // These lines are the same
     stream := dispatcher.NewEventStream()
-
+    defer stream.Close()
 
     // We changed the variable name to `syncEvent` and we changed the method from `Stream()` to `SyncStream()`
     for syncEvent := range stream.SyncStream() {
@@ -190,6 +196,8 @@ stream := dispatcher.NewFilteredEventStream(func(event MyEvent) bool {
 
 // typically, a stream will be handled in a separate goroutine
 go func() {
+    defer stream.Close()
+
     for event := range stream.Stream() {
         fmt.Println(event.Message)
     }
